@@ -32,6 +32,34 @@ def _safe_name(name: str) -> str:
     return name or "SEM NOME"
 
 
+def safe_move(src, dest, expected_sha: str) -> bool:
+    """Move SEGURO: copia → confere o hash do destino → só então apaga a origem.
+    Se a cópia não bater, apaga o destino e levanta erro (a origem fica INTACTA).
+    Retorna True se a origem foi removida; False se o destino ficou OK mas não deu
+    pra apagar a origem (o documento já está salvo na biblioteca, sem perda)."""
+    src, dest = Path(src), Path(dest)
+    try:
+        shutil.copy2(str(src), str(dest))   # copia conteúdo + metadados
+    except Exception:
+        if dest.exists():                   # limpa cópia parcial; origem intacta
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+        raise
+    if sha256_of(str(dest)) != expected_sha:   # conferência de integridade
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(f"Cópia não confere (hash diferente): {src.name}")
+    try:
+        src.unlink()                        # só agora apaga a origem
+        return True
+    except OSError:
+        return False
+
+
 @dataclass
 class IngestResult:
     status: str            # "ingested" | "duplicate"
@@ -97,7 +125,7 @@ class Library:
             qdir = self.root / QUARANTINE / date.today().isoformat()
             qdir.mkdir(parents=True, exist_ok=True)
             dest = self._unique_dest(qdir, original_name)
-            shutil.move(str(src), str(dest))
+            safe_move(src, dest, sha256)
             res.status = "duplicate"
             res.final_path = str(dest)
             res.dup_importer = existing["importer"] or ""
@@ -111,7 +139,7 @@ class Library:
         folder.mkdir(parents=True, exist_ok=True)
         dest = self._unique_dest(folder, original_name)
         size = src.stat().st_size
-        shutil.move(str(src), str(dest))
+        safe_move(src, dest, sha256)
         rel = self._rel(dest)
         doc_id = self.db.add_document(
             sha256=sha256, rel_path=rel, original_name=original_name,
@@ -134,7 +162,7 @@ class Library:
         orig = Path(res.original_path)
         orig.parent.mkdir(parents=True, exist_ok=True)
         dest = orig if not orig.exists() else self._unique_dest(orig.parent, orig.name)
-        shutil.move(str(cur), str(dest))
+        safe_move(cur, dest, res.sha256)
         if res.status == "ingested" and res.doc_id:
             self.db.remove_document(res.doc_id)
         self.db.log("undo", res.sha256, str(cur), str(dest), f"desfez {res.status}")

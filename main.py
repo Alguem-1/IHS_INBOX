@@ -465,11 +465,16 @@ class MainWindow(QMainWindow):
         lib = self.lib
 
         def task():
-            out = []
+            out, errors = [], []
             for path, ref, imp, dtype in rows:
-                if Path(path).exists():
+                if not Path(path).exists():
+                    continue
+                try:
                     out.append(lib.commit(path, imp, ref, dtype))
-            return out
+                except Exception as e:
+                    # move seguro falhou → origem preservada; segue os demais
+                    errors.append(f"{Path(path).name}: {e}")
+            return out, errors
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self._run(task, self._on_archive_done, self._on_archive_fail)
@@ -478,8 +483,9 @@ class MainWindow(QMainWindow):
         QApplication.restoreOverrideCursor()
         QMessageBox.critical(self, "Erro", f"Falha ao arquivar: {e}")
 
-    def _on_archive_done(self, results):
+    def _on_archive_done(self, payload):
         QApplication.restoreOverrideCursor()
+        results, errors = payload
         self.last_results = results
         ing = sum(1 for r in results if r.status == "ingested")
         dup = sum(1 for r in results if r.status == "duplicate")
@@ -490,12 +496,20 @@ class MainWindow(QMainWindow):
             else:
                 self._log_recent(
                     f"⊘ {r.original_name}: duplicado de {r.dup_process or '?'} → _duplicados")
+        for e in errors:
+            self._log_recent(f"✗ {e}")
         self.btn_undo.setEnabled(bool(results))
         msg = f"{ing} arquivado(s)."
         if dup:
             msg += (f" {dup} duplicado(s) movido(s) para _duplicados "
                     "(não duplicados na biblioteca).")
-        QMessageBox.information(self, "Concluído", msg)
+        if errors:
+            msg += (f"\n\n{len(errors)} falha(s) — a origem foi preservada:\n- "
+                    + "\n- ".join(errors[:8]))
+            if len(errors) > 8:
+                msg += f"\n… e mais {len(errors) - 8}."
+        (QMessageBox.warning if errors else QMessageBox.information)(
+            self, "Concluído", msg)
         self._reload_filters()
         self._reload_audit()
         self._refresh_status()
