@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+
+# A biblioteca de documentos NUNCA entra no git (dados sensíveis + tamanho).
+# Por padrão ela vive fora do repo (~/IHS-Biblioteca), mas ignoramos nomes
+# comuns por segurança caso alguém aponte a raiz pra dentro do projeto.
+/IHS-Biblioteca/
+/biblioteca/
