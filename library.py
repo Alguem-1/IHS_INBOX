@@ -32,6 +32,23 @@ def _safe_name(name: str) -> str:
     return name or "SEM NOME"
 
 
+def _san_token(v) -> str:
+    """Sanitiza um pedaço do nome da pasta (fatura/BL). Diferente de _safe_name:
+    devolve "" quando vazio, pra a parte ser OMITIDA do nome (sem 'SEM NOME')."""
+    s = "" if v is None else str(v).strip()
+    s = re.sub(r'[\\/:*?"<>|]+', " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _folder_name(reference: str, fatura="", bl="") -> str:
+    """Nome da pasta do processo: reference[_fatura][_bl], omitindo o que faltar.
+    Ex.: 'IHS057-26_INV12345_MEDU98765', 'IHS057-26_INV12345', 'IHS057-26'."""
+    ref = (reference or "").strip().upper()
+    parts = [p for p in (ref, _san_token(fatura), _san_token(bl)) if p]
+    return "_".join(parts) if parts else "SEM PROCESSO"
+
+
 def safe_move(src, dest, expected_sha: str) -> bool:
     """Move SEGURO: copia → confere o hash do destino → só então apaga a origem.
     Se a cópia não bater, apaga o destino e levanta erro (a origem fica INTACTA).
@@ -103,6 +120,94 @@ class Library:
                 return cand
             i += 1
 
+    # ── pastas de processo (nome enriquecido ref_fatura_bl) ───────
+    @staticmethod
+    def _find_existing_folder(importer_dir: Path, ref: str):
+        """Acha a pasta que 'pertence' ao processo `ref` dentro do importador:
+        nome == ref ou começa com ref + '_'. A reference é a chave estável."""
+        ref = (ref or "").strip().upper()
+        if not ref or not importer_dir.is_dir():
+            return None
+        for child in importer_dir.iterdir():
+            if not child.is_dir():
+                continue
+            name = child.name.upper()
+            if name == ref or name.startswith(ref + "_"):
+                return child
+        return None
+
+    def _folder_name_from_cache(self, reference: str) -> str:
+        """Monta o nome enriquecido lendo fatura/BL do cache do UTILS (se houver)."""
+        ref = (reference or "").strip().upper()
+        if not ref:
+            return "SEM PROCESSO"
+        row = self.db.get_cached_process(ref)
+        if row is None:
+            return ref
+        return _folder_name(ref, row["invoice_number"], row["bl_number"])
+
+    def process_dir(self, importer: str, reference: str, create=False) -> Path:
+        """Caminho da pasta do processo dentro do importador. Reusa a pasta já
+        existente (achada pela reference); senão usa o nome enriquecido do cache.
+        Com create=True garante que a árvore exista."""
+        importer = _safe_name(importer)
+        ref = (reference or "").strip().upper()
+        importer_dir = self.root / importer
+        if ref:
+            existing = self._find_existing_folder(importer_dir, ref)
+            folder = existing if existing else importer_dir / self._folder_name_from_cache(ref)
+        else:
+            folder = importer_dir / "SEM PROCESSO"
+        if create:
+            folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def sync_process_folders(self, processes) -> dict:
+        """O botão. Para cada processo do UTILS, garante a pasta
+        importador/REF[_fatura][_bl]: cria se faltar, RENOMEIA a pasta existente
+        quando o nome enriquecido muda (e atualiza o rel_path dos documentos).
+        Idempotente. Nunca aborta o lote — erros por processo são acumulados."""
+        report = {"created": [], "renamed": [], "skipped": 0,
+                  "no_importer": 0, "errors": []}
+        for p in processes:
+            ref = (p["reference"] or "").strip().upper() if p["reference"] else ""
+            if not ref:
+                continue
+            importer = (p["importer"] or "").strip() if p["importer"] else ""
+            if not importer:
+                report["no_importer"] += 1
+                continue
+            try:
+                importer_dir = self.root / _safe_name(importer)
+                importer_dir.mkdir(parents=True, exist_ok=True)
+                desired = _folder_name(ref, p["invoice_number"], p["bl_number"])
+                existing = self._find_existing_folder(importer_dir, ref)
+                if existing is None:
+                    target = importer_dir / desired
+                    target.mkdir(parents=True, exist_ok=True)
+                    self.db.log("mkdir_process", "", "", str(target),
+                                f"{importer} / {ref}")
+                    report["created"].append(self._rel(target))
+                elif existing.name == desired:
+                    report["skipped"] += 1
+                else:
+                    target = importer_dir / desired
+                    if target.exists():
+                        # colisão inesperada: não mexe, registra como erro leve.
+                        report["errors"].append(
+                            f"{ref}: já existe '{desired}' (não renomeei)")
+                        continue
+                    old_rel = self._rel(existing)
+                    existing.rename(target)
+                    new_rel = self._rel(target)
+                    n = self.db.reparent_documents(old_rel, new_rel)
+                    self.db.log("rename_process", "", str(existing), str(target),
+                                f"{importer} / {ref} ({n} docs)")
+                    report["renamed"].append((old_rel, new_rel))
+            except Exception as e:  # nunca derruba o lote
+                report["errors"].append(f"{ref}: {e}")
+        return report
+
     # ── ingestão ──────────────────────────────────────────────────
     def commit(self, src_path: str, importer: str, process_ref: str,
                doc_type: str, sha256: str = None) -> IngestResult:
@@ -134,9 +239,9 @@ class Library:
                         f"duplicado de {existing['process_ref'] or '?'}")
             return res
 
-        # Move pra Importador/Processo/
-        folder = self.root / importer / (process_ref or "SEM PROCESSO")
-        folder.mkdir(parents=True, exist_ok=True)
+        # Move pra Importador/Processo/ (nome enriquecido ref_fatura_bl quando
+        # o cache do UTILS tiver fatura/BL; reusa a pasta já existente do processo).
+        folder = self.process_dir(importer, process_ref, create=True)
         dest = self._unique_dest(folder, original_name)
         size = src.stat().st_size
         safe_move(src, dest, sha256)

@@ -162,9 +162,30 @@ class DB:
             "SELECT * FROM processes_cache WHERE reference = ?",
             (reference,)).fetchone()
 
+    def all_cached_processes(self) -> list:
+        return self.conn.execute(
+            "SELECT * FROM processes_cache ORDER BY importer, reference").fetchall()
+
     def cached_process_count(self) -> int:
         return self.conn.execute(
             "SELECT COUNT(*) AS n FROM processes_cache").fetchone()["n"]
+
+    def reparent_documents(self, old_prefix: str, new_prefix: str) -> int:
+        """Reaponta os documentos quando a pasta de um processo é renomeada:
+        troca o prefixo de rel_path de old_prefix/ para new_prefix/. Os prefixos
+        são caminhos POSIX relativos à raiz (ex.: 'IMP/IHS057-26'). Retorna o
+        número de linhas atualizadas.
+
+        Casa o prefixo por comparação EXATA (substr), não com LIKE: o nome da
+        pasta antiga pode conter '_' (ex.: 'REF_FATURA' → 'REF_FATURA_BL') e no
+        LIKE o '_' é curinga, o que poderia atingir documentos de outro processo."""
+        cut = len(old_prefix) + 1          # preserva a '/' que inicia o resto
+        cur = self.conn.execute(
+            "UPDATE documents SET rel_path = ? || substr(rel_path, ?) "
+            "WHERE substr(rel_path, 1, ?) = ?",
+            (new_prefix, cut, cut, old_prefix + "/"))
+        self.conn.commit()
+        return cur.rowcount
 
     # ── audit_log ─────────────────────────────────────────────────
     def log(self, action, sha256="", from_path="", to_path="", detail="") -> None:

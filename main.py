@@ -233,11 +233,14 @@ class MainWindow(QMainWindow):
         self.btn_undo = QPushButton("Desfazer último")
         self.btn_undo.setEnabled(False)
         self.btn_undo.clicked.connect(self._undo_last)
+        b_folders = QPushButton("Criar/atualizar pastas (UTILS)")
+        b_folders.clicked.connect(self._create_process_folders)
         b_login = QPushButton("Conectar UTILS…")
         b_login.clicked.connect(self._prompt_utils_login)
         row.addWidget(b1)
         row.addWidget(b2)
         row.addWidget(self.btn_undo)
+        row.addWidget(b_folders)
         row.addStretch(1)
         row.addWidget(b_login)
         lay.addLayout(row)
@@ -413,6 +416,68 @@ class MainWindow(QMainWindow):
             lambda n: (self._refresh_status(),
                        self._log_recent(f"UTILS: {n} processo(s) sincronizado(s).")),
             lambda e: self._log_recent(f"UTILS: falha ao sincronizar ({e})."))
+
+    # ---- criar/atualizar pastas dos processos ----
+    def _create_process_folders(self):
+        """Pré-cria (ou renomeia) a pasta de cada processo do UTILS dentro da
+        subpasta do importador, com o nome enriquecido REF[_fatura][_bl].
+        Idempotente: já existindo, não duplica; se fatura/BL mudaram, renomeia."""
+        if not self.utils_client and self.db.cached_process_count() == 0:
+            QMessageBox.information(
+                self, "Sem dados",
+                "Não há processos em cache e o UTILS está offline.\n"
+                "Conecte ao UTILS primeiro para puxar os processos.")
+            return
+        client = self.utils_client
+        db = self.db
+        lib = self.lib
+
+        def task():
+            if client:   # online: atualiza o cache antes (igual ao _sync_cache)
+                procs = client.list_processes()
+                norm = [{
+                    "reference": d.get("reference"),
+                    "importer": d.get("importer"),
+                    "client_id": d.get("client_id"),
+                    "status": d.get("status"),
+                    "invoice_number": d.get("invoice_number"),
+                    "bl_number": d.get("bl_number"),
+                    "di_number": d.get("di_number"),
+                } for d in procs if d.get("reference")]
+                db.upsert_processes(norm)
+            return lib.sync_process_folders(db.all_cached_processes())
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._run(task, self._on_folders_done, self._on_folders_fail)
+
+    def _on_folders_fail(self, e):
+        QApplication.restoreOverrideCursor()
+        QMessageBox.critical(self, "Erro", f"Falha ao criar pastas: {e}")
+
+    def _on_folders_done(self, report):
+        QApplication.restoreOverrideCursor()
+        nc = len(report["created"])
+        nr = len(report["renamed"])
+        for rel in report["created"]:
+            self._log_recent(f"+ pasta criada: {rel}")
+        for old_rel, new_rel in report["renamed"]:
+            self._log_recent(f"↻ renomeada: {old_rel} → {new_rel}")
+        for err in report["errors"]:
+            self._log_recent(f"✗ {err}")
+        msg = (f"{nc} pasta(s) criada(s), {nr} renomeada(s), "
+               f"{report['skipped']} já em dia.")
+        if report["no_importer"]:
+            msg += f"\n{report['no_importer']} processo(s) sem importador (omitidos)."
+        if report["errors"]:
+            msg += (f"\n\n{len(report['errors'])} aviso(s):\n- "
+                    + "\n- ".join(report["errors"][:8]))
+            if len(report["errors"]) > 8:
+                msg += f"\n… e mais {len(report['errors']) - 8}."
+        (QMessageBox.warning if report["errors"] else QMessageBox.information)(
+            self, "Pastas dos processos", msg)
+        self._reload_filters()
+        self._reload_audit()
+        self._refresh_status()
 
     # ---- arquivamento ----
     def _archive_files(self):
