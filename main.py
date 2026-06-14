@@ -190,6 +190,97 @@ class TriageDialog(QDialog):
         self.accept()
 
 
+# ── diálogo: escolher subpastas ao arquivar uma pasta-mãe ──────────
+class FolderPickDialog(QDialog):
+    """Ao arquivar uma pasta-mãe com subpastas, escolher quais entram. Mostra o
+    processo detectado pelo NOME da subpasta, pra ignorar as que não são de
+    processo (e os arquivos dentro delas). Tudo marcado por padrão."""
+    COLS = ["Arquivar?", "Pasta", "Processo detectado", "Arquivos"]
+
+    def __init__(self, entries, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Arquivar pasta — escolher subpastas")
+        self.resize(720, 480)
+        self.setStyleSheet(T.MAIN_STYLESHEET)
+        self.entries = entries
+        self.selected_indices = []
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 18, 18, 18)
+        lay.setSpacing(12)
+        title = QLabel(f"{len(self.entries)} item(ns) na pasta")
+        title.setStyleSheet(T.LBL_PAGE_TITLE)
+        lay.addWidget(title)
+        note = QLabel("Desmarque as subpastas que NÃO são de processo — elas e os "
+                      "arquivos dentro serão ignorados (nada é movido).")
+        note.setStyleSheet(T.LBL_HINT)
+        note.setWordWrap(True)
+        lay.addWidget(note)
+
+        self.table = QTableWidget(len(self.entries), len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        for i, e in enumerate(self.entries):
+            chk = QTableWidgetItem()
+            chk.setFlags((chk.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                         & ~Qt.ItemFlag.ItemIsEditable)
+            chk.setCheckState(Qt.CheckState.Checked)
+            self.table.setItem(i, 0, chk)
+            icon = "🗎  " if e["loose"] else "📁  "
+            self.table.setItem(i, 1, QTableWidgetItem(icon + e["name"]))
+            self.table.setItem(i, 2, QTableWidgetItem(e["process"] or "— sem processo —"))
+            self.table.setItem(i, 3, QTableWidgetItem(f'{e["count"]} arq.'))
+        lay.addWidget(self.table, 1)
+
+        tools = QHBoxLayout()
+        b_all = QPushButton("Marcar todos")
+        b_all.clicked.connect(lambda: self._set_all(True))
+        b_none = QPushButton("Desmarcar todos")
+        b_none.clicked.connect(lambda: self._set_all(False))
+        b_noproc = QPushButton("Desmarcar sem processo")
+        b_noproc.clicked.connect(self._uncheck_no_process)
+        tools.addWidget(b_all)
+        tools.addWidget(b_none)
+        tools.addWidget(b_noproc)
+        tools.addStretch(1)
+        lay.addLayout(tools)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        b_cancel = QPushButton("Cancelar")
+        b_cancel.clicked.connect(self.reject)
+        b_ok = QPushButton("Continuar")
+        b_ok.setStyleSheet(T.BTN_PRIMARY)
+        b_ok.clicked.connect(self._accept)
+        row.addWidget(b_cancel)
+        row.addWidget(b_ok)
+        lay.addLayout(row)
+
+    def _set_all(self, on):
+        st = Qt.CheckState.Checked if on else Qt.CheckState.Unchecked
+        for i in range(self.table.rowCount()):
+            self.table.item(i, 0).setCheckState(st)
+
+    def _uncheck_no_process(self):
+        for i, e in enumerate(self.entries):
+            if not e["process"]:
+                self.table.item(i, 0).setCheckState(Qt.CheckState.Unchecked)
+
+    def _accept(self):
+        self.selected_indices = [
+            i for i in range(self.table.rowCount())
+            if self.table.item(i, 0).checkState() == Qt.CheckState.Checked]
+        self.accept()
+
+
 # ── janela principal ──────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self, library_root):
@@ -504,10 +595,54 @@ class MainWindow(QMainWindow):
             self, "Escolher pasta para arquivar", str(Path.home()))
         if not d:
             return
-        files = [str(p) for p in Path(d).rglob("*")
-                 if p.is_file() and not p.name.startswith(".")]
+        root = Path(d)
+        try:
+            children = sorted(root.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            children = []
+        subdirs = [p for p in children if p.is_dir() and not p.name.startswith(".")]
+        loose = [p for p in children if p.is_file() and not p.name.startswith(".")]
+
+        # Sem subpastas: arquiva os arquivos soltos (comportamento de sempre).
+        if not subdirs:
+            files = [str(p) for p in loose]
+            if not files:
+                QMessageBox.information(self, "Vazio", "Nenhum arquivo na pasta.")
+                return
+            self._start_archive(files)
+            return
+
+        # Com subpastas: deixa escolher quais entram (ignorar as que não são processo).
+        # A detecção é pelo NOME da subpasta (não pelo caminho), pra a pasta-mãe não
+        # "contaminar" todas as subpastas com o processo dela.
+        matcher = ProcessMatcher(self.db.all_cached_processes())
+        entries = []
+        for sub in subdirs:
+            m = matcher.match(sub.name)
+            entries.append({"path": sub, "name": sub.name,
+                            "process": m.reference if m else "",
+                            "count": self._count_docs(sub, recursive=True),
+                            "loose": False})
+        if loose:
+            entries.append({"path": root, "name": "(arquivos soltos nesta pasta)",
+                            "process": "", "count": len(loose), "loose": True})
+
+        dlg = FolderPickDialog(entries, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        files = []
+        for i in dlg.selected_indices:
+            e = entries[i]
+            if e["loose"]:
+                files += [str(p) for p in e["path"].iterdir()
+                          if p.is_file() and not p.name.startswith(".")]
+            else:
+                files += [str(p) for p in e["path"].rglob("*")
+                          if p.is_file() and not p.name.startswith(".")]
         if not files:
-            QMessageBox.information(self, "Vazio", "Nenhum arquivo na pasta.")
+            QMessageBox.information(
+                self, "Nada selecionado",
+                "Nenhuma subpasta marcada — nada foi arquivado.")
             return
         self._start_archive(files)
 
