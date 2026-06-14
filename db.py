@@ -97,6 +97,10 @@ class DB:
         return self.conn.execute(
             "SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
 
+    def get_by_rel_path(self, rel_path: str):
+        return self.conn.execute(
+            "SELECT * FROM documents WHERE rel_path = ?", (rel_path,)).fetchone()
+
     def set_status(self, doc_id: int, status: str) -> None:
         self.conn.execute(
             "UPDATE documents SET status = ? WHERE id = ?", (status, doc_id))

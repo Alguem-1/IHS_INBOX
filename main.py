@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 import config
 import theme as T
 from db import DB
-from library import Library
+from library import Library, QUARANTINE
 from intake import build_proposal, ProcessMatcher, DOC_TYPES, DOC_TYPE_LABELS
 from worker import Worker
 import utils_api
@@ -263,38 +263,45 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(10)
 
+        # estado da navegação: importadores → processos → documentos
+        self._lib_importer = None
+        self._lib_folder = None
+        self._lib_search = ""
+
         bar = QHBoxLayout()
         self.f_text = QLineEdit()
-        self.f_text.setPlaceholderText("buscar nome / processo / importador…")
-        self.f_text.returnPressed.connect(self._do_search)
-        self.f_imp = QComboBox()
-        self.f_imp.addItem("Todos importadores", "")
-        self.f_type = QComboBox()
-        self.f_type.addItem("Todos tipos", "")
-        for t in DOC_TYPES:
-            self.f_type.addItem(DOC_TYPE_LABELS.get(t, t), t)
+        self.f_text.setPlaceholderText(
+            "buscar em TODA a biblioteca: nome / processo / importador…")
+        self.f_text.returnPressed.connect(self._lib_run_search)
         b_search = QPushButton("Buscar")
-        b_search.clicked.connect(self._do_search)
-        b_refresh = QPushButton("Atualizar")
-        b_refresh.clicked.connect(self._reload_filters)
+        b_search.clicked.connect(self._lib_run_search)
         bar.addWidget(self.f_text, 1)
-        bar.addWidget(self.f_imp)
-        bar.addWidget(self.f_type)
         bar.addWidget(b_search)
-        bar.addWidget(b_refresh)
         lay.addLayout(bar)
 
+        nav = QHBoxLayout()
+        self.btn_lib_back = QPushButton("⬅ Voltar")
+        self.btn_lib_back.clicked.connect(self._lib_back)
+        self.lib_crumb = QLabel("")
+        self.lib_crumb.setStyleSheet(T.LBL_SECTION)
+        self.btn_lib_openfolder = QPushButton("Abrir pasta")
+        self.btn_lib_openfolder.clicked.connect(self._lib_open_folder)
+        b_refresh = QPushButton("Atualizar")
+        b_refresh.clicked.connect(self._lib_reload)
+        nav.addWidget(self.btn_lib_back)
+        nav.addWidget(self.lib_crumb, 1)
+        nav.addWidget(self.btn_lib_openfolder)
+        nav.addWidget(b_refresh)
+        lay.addLayout(nav)
+
         split = QSplitter(Qt.Orientation.Horizontal)
-        self.results = QTableWidget(0, 6)
-        self.results.setHorizontalHeaderLabels(
-            ["Importador", "Processo", "Tipo", "Arquivo", "Status", "Tamanho"])
+        self.results = QTableWidget(0, 1)
         self.results.verticalHeader().setVisible(False)
         self.results.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.results.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.results.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.results.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.results.itemSelectionChanged.connect(self._on_select_doc)
-        self.results.doubleClicked.connect(self._open_selected)
+        self.results.itemSelectionChanged.connect(self._lib_on_select)
+        self.results.doubleClicked.connect(self._lib_open_row)
         split.addWidget(self.results)
 
         right = QWidget()
@@ -324,7 +331,7 @@ class MainWindow(QMainWindow):
         split.setSizes([640, 480])
         lay.addWidget(split, 1)
 
-        self._reload_filters()
+        self._lib_reload()
         return w
 
     def _build_audit_tab(self):
@@ -481,7 +488,7 @@ class MainWindow(QMainWindow):
                 msg += f"\n… e mais {len(report['errors']) - 8}."
         (QMessageBox.warning if report["errors"] else QMessageBox.information)(
             self, "Pastas dos processos", msg)
-        self._reload_filters()
+        self._lib_reload()
         self._reload_audit()
         self._refresh_status()
 
@@ -585,7 +592,7 @@ class MainWindow(QMainWindow):
                 msg += f"\n… e mais {len(errors) - 8}."
         (QMessageBox.warning if errors else QMessageBox.information)(
             self, "Concluído", msg)
-        self._reload_filters()
+        self._lib_reload()
         self._reload_audit()
         self._refresh_status()
 
@@ -608,66 +615,222 @@ class MainWindow(QMainWindow):
         self._log_recent(f"Desfeito: {ok} item(s) devolvido(s) à origem.")
         self.last_results = []
         self.btn_undo.setEnabled(False)
-        self._reload_filters()
+        self._lib_reload()
         self._reload_audit()
         self._refresh_status()
 
-    # ---- biblioteca / busca ----
-    def _reload_filters(self):
-        self.f_imp.blockSignals(True)
-        self.f_imp.clear()
-        self.f_imp.addItem("Todos importadores", "")
-        for imp in self.db.list_importers():
-            self.f_imp.addItem(imp, imp)
-        self.f_imp.blockSignals(False)
-        self._do_search()
+    # ---- biblioteca: navegação por pastas (importador → processo → docs) ----
+    def _lib_level(self):
+        if self._lib_search:
+            return "busca"
+        if self._lib_importer is None:
+            return "importadores"
+        if self._lib_folder is None:
+            return "processos"
+        return "documentos"
 
-    def _do_search(self):
-        rows = self.db.search(
-            text=self.f_text.text().strip(),
-            importer=self.f_imp.currentData() or None,
-            doc_type=self.f_type.currentData() or None)
-        self._fill_results(rows)
+    def _lib_dirs(self, path, exclude=()):
+        try:
+            names = [p.name for p in path.iterdir()
+                     if p.is_dir() and not p.name.startswith(".")
+                     and p.name not in exclude]
+        except OSError:
+            return []
+        return sorted(names, key=str.lower)
 
-    def _fill_results(self, rows):
+    @staticmethod
+    def _count_docs(path, recursive):
+        n = 0
+        try:
+            it = path.rglob("*") if recursive else path.iterdir()
+            for p in it:
+                if p.is_file() and not p.name.startswith("."):
+                    n += 1
+        except OSError:
+            pass
+        return n
+
+    def _lib_cur_folder(self):
+        """Pasta no disco do nível atual (p/ o botão 'Abrir pasta')."""
+        root = self.lib.root
+        if self._lib_importer is None:
+            return root
+        if self._lib_folder is None:
+            return root / self._lib_importer
+        return root / self._lib_importer / self._lib_folder
+
+    def _lib_run_search(self):
+        self._lib_search = self.f_text.text().strip()
+        self._lib_reload()
+
+    def _lib_back(self):
+        if self._lib_search:
+            self._lib_search = ""
+            self.f_text.clear()
+        elif self._lib_folder is not None:
+            self._lib_folder = None
+        elif self._lib_importer is not None:
+            self._lib_importer = None
+        self._lib_reload()
+
+    def _lib_open_folder(self):
+        # na busca, abre a pasta do doc selecionado (se houver); senão a pasta atual
+        if self._lib_search:
+            kind, payload, _ = self._lib_selected()
+            if kind == "doc":
+                open_path(Path(payload).parent)
+                return
+        open_path(self._lib_cur_folder())
+
+    def _setup_cols(self, headers, stretch_col):
+        self.results.setColumnCount(len(headers))
+        self.results.setHorizontalHeaderLabels(headers)
+        h = self.results.horizontalHeader()
+        for c in range(len(headers)):
+            h.setSectionResizeMode(
+                c, QHeaderView.ResizeMode.Stretch if c == stretch_col
+                else QHeaderView.ResizeMode.ResizeToContents)
+
+    def _lib_reload(self):
+        level = self._lib_level()
+        self._clear_preview()
+        self.btn_lib_back.setEnabled(level != "importadores")
+        if level == "busca":
+            self.lib_crumb.setText(f"Busca: “{self._lib_search}”")
+            self._lib_render_search(self._lib_search)
+        elif level == "importadores":
+            self.lib_crumb.setText("Biblioteca")
+            self._lib_render_importers()
+        elif level == "processos":
+            self.lib_crumb.setText(f"Biblioteca  ›  {self._lib_importer}")
+            self._lib_render_dirs(self.lib.root / self._lib_importer, "processo")
+        else:
+            self.lib_crumb.setText(
+                f"Biblioteca  ›  {self._lib_importer}  ›  {self._lib_folder}")
+            self._lib_render_docs(self._lib_importer, self._lib_folder)
+
+    def _set_dir_row(self, i, name, count_text):
+        it = QTableWidgetItem(f"📁  {name}")
+        it.setData(Qt.ItemDataRole.UserRole, ("dir", name))
+        self.results.setItem(i, 0, it)
+        self.results.setItem(i, 1, QTableWidgetItem(count_text))
+
+    def _lib_render_importers(self):
+        names = self._lib_dirs(self.lib.root, exclude={QUARANTINE})
+        self._setup_cols(["Importador", "Conteúdo"], 0)
+        self.results.setRowCount(len(names))
+        for i, name in enumerate(names):
+            n = self._count_docs(self.lib.root / name, recursive=True)
+            self._set_dir_row(i, name, f"{n} doc(s)")
+        self.info.setText(
+            f"{len(names)} importador(es). Abra um (duplo-clique) para ver os processos.")
+
+    def _lib_render_dirs(self, parent, kind):
+        names = self._lib_dirs(parent)
+        self._setup_cols([f"Pasta ({kind})", "Conteúdo"], 0)
+        self.results.setRowCount(len(names))
+        for i, name in enumerate(names):
+            n = self._count_docs(parent / name, recursive=False)
+            self._set_dir_row(i, name, f"{n} doc(s)")
+        self.info.setText(
+            f"{len(names)} pasta(s). Abra uma (duplo-clique) para ver os documentos.")
+
+    def _lib_render_docs(self, importer, folder):
+        folder_abs = self.lib.root / importer / folder
+        try:
+            files = sorted([p for p in folder_abs.iterdir()
+                            if p.is_file() and not p.name.startswith(".")],
+                           key=lambda p: p.name.lower())
+        except OSError:
+            files = []
+        self._setup_cols(["Arquivo", "Tipo", "Status", "Tamanho"], 0)
+        self.results.setRowCount(len(files))
+        for i, p in enumerate(files):
+            rel = f"{importer}/{folder}/{p.name}"
+            r = self.db.get_by_rel_path(rel)
+            dtype = DOC_TYPE_LABELS.get(r["doc_type"], r["doc_type"] or "") if r else ""
+            status = r["status"] if r else "(fora do índice)"
+            size = r["size_bytes"] if r else p.stat().st_size
+            it = QTableWidgetItem(f"📄  {p.name}")
+            it.setData(Qt.ItemDataRole.UserRole, ("doc", str(p)))
+            it.setData(Qt.ItemDataRole.UserRole + 1, r["id"] if r else None)
+            self.results.setItem(i, 0, it)
+            self.results.setItem(i, 1, QTableWidgetItem(dtype))
+            self.results.setItem(i, 2, QTableWidgetItem(status))
+            self.results.setItem(i, 3, QTableWidgetItem(human_size(size)))
+        self.info.setText(f"{len(files)} documento(s) nesta pasta. Clique para pré-visualizar.")
+
+    def _lib_render_search(self, query):
+        rows = self.db.search(text=query)
+        self._setup_cols(
+            ["Importador", "Processo", "Tipo", "Arquivo", "Status", "Tamanho"], 3)
         self.results.setRowCount(len(rows))
         for i, r in enumerate(rows):
+            name = r["original_name"] or Path(r["rel_path"]).name
             vals = [r["importer"] or "", r["process_ref"] or "",
                     DOC_TYPE_LABELS.get(r["doc_type"], r["doc_type"] or ""),
-                    r["original_name"] or Path(r["rel_path"]).name,
-                    r["status"] or "", human_size(r["size_bytes"])]
+                    name, r["status"] or "", human_size(r["size_bytes"])]
             for c, v in enumerate(vals):
                 it = QTableWidgetItem(str(v))
-                if c == 0:
-                    it.setData(Qt.ItemDataRole.UserRole, r["id"])
+                if c == 0:   # marcador do doc fica sempre na col 0
+                    it.setData(Qt.ItemDataRole.UserRole,
+                               ("doc", str(self.lib.abs_path(r["rel_path"]))))
+                    it.setData(Qt.ItemDataRole.UserRole + 1, r["id"])
                 self.results.setItem(i, c, it)
-        self.preview_lbl.setPixmap(QPixmap())
-        self.preview_lbl.setText("—")
-        self.info.setText(f"{len(rows)} documento(s).")
+        self.info.setText(f"{len(rows)} documento(s) encontrados.")
 
-    def _current_doc_id(self):
+    def _lib_selected(self):
+        """(kind, payload, doc_id) da linha selecionada. kind: 'dir'|'doc'|None."""
         row = self.results.currentRow()
         if row < 0:
-            return None
+            return (None, None, None)
         it = self.results.item(row, 0)
-        return it.data(Qt.ItemDataRole.UserRole) if it else None
+        data = it.data(Qt.ItemDataRole.UserRole) if it else None
+        if not data:
+            return (None, None, None)
+        return (data[0], data[1], it.data(Qt.ItemDataRole.UserRole + 1))
 
-    def _on_select_doc(self):
-        did = self._current_doc_id()
-        if did is None:
+    def _lib_open_row(self, *args):
+        kind, payload, _ = self._lib_selected()
+        if kind == "dir":
+            if self._lib_importer is None:
+                self._lib_importer = payload
+            elif self._lib_folder is None:
+                self._lib_folder = payload
+            self._lib_reload()
+        elif kind == "doc":
+            open_path(payload)
+
+    def _clear_preview(self):
+        self.preview_lbl.setPixmap(QPixmap())
+        self.preview_lbl.setText("—")
+        self.info.setText("Selecione um documento.")
+        self.b_status.setEnabled(False)
+
+    def _lib_on_select(self):
+        kind, payload, did = self._lib_selected()
+        if kind != "doc":
+            self.b_status.setEnabled(False)
             return
-        r = self.db.get_document(did)
-        if not r:
-            return
-        abs_p = self.lib.abs_path(r["rel_path"])
-        self.info.setText(
-            f"<b>{r['original_name']}</b><br>{r['importer']} / {r['process_ref']} · "
-            f"{DOC_TYPE_LABELS.get(r['doc_type'], r['doc_type'] or '')}<br>"
-            f"Status: {r['status']} · {human_size(r['size_bytes'])}<br>"
-            f"<span style='color:{T.TEXT_MUTED}'>{r['rel_path']}</span>")
-        self.b_status.setText(
-            "Marcar recebido" if r["status"] == "conferido" else "Marcar conferido")
-        self._show_preview(str(abs_p))
+        if did:
+            r = self.db.get_document(did)
+            if r:
+                self.info.setText(
+                    f"<b>{r['original_name']}</b><br>{r['importer']} / {r['process_ref']} · "
+                    f"{DOC_TYPE_LABELS.get(r['doc_type'], r['doc_type'] or '')}<br>"
+                    f"Status: {r['status']} · {human_size(r['size_bytes'])}<br>"
+                    f"<span style='color:{T.TEXT_MUTED}'>{r['rel_path']}</span>")
+                self.b_status.setEnabled(True)
+                self.b_status.setText(
+                    "Marcar recebido" if r["status"] == "conferido" else "Marcar conferido")
+        else:
+            p = Path(payload)
+            size = p.stat().st_size if p.exists() else 0
+            self.info.setText(
+                f"<b>{p.name}</b><br><span style='color:{T.TEXT_MUTED}'>"
+                f"(arquivo solto, fora do índice)</span><br>{human_size(size)}")
+            self.b_status.setEnabled(False)
+        self._show_preview(payload)
 
     def _show_preview(self, path):
         if not Path(path).exists():
@@ -685,22 +848,19 @@ class MainWindow(QMainWindow):
                                   Qt.TransformationMode.SmoothTransformation))
 
     def _open_selected(self):
-        did = self._current_doc_id()
-        if did is None:
-            return
-        r = self.db.get_document(did)
-        if r:
-            open_path(self.lib.abs_path(r["rel_path"]))
+        kind, payload, _ = self._lib_selected()
+        if kind == "doc":
+            open_path(payload)
 
     def _toggle_status(self):
-        did = self._current_doc_id()
-        if did is None:
+        kind, payload, did = self._lib_selected()
+        if kind != "doc" or not did:
             return
         r = self.db.get_document(did)
         new = "recebido" if r["status"] == "conferido" else "conferido"
         self.db.set_status(did, new)
         self.db.log("status", r["sha256"], detail=f"{r['original_name']} → {new}")
-        self._do_search()
+        self._lib_reload()
         self._reload_audit()
 
     # ---- auditoria ----
@@ -716,7 +876,7 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, idx):
         if idx == 1:
-            self._do_search()
+            self._lib_reload()
         elif idx == 2:
             self._reload_audit()
 
