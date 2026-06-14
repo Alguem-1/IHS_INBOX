@@ -23,7 +23,7 @@ import config
 import theme as T
 from db import DB
 from library import Library
-from intake import build_proposal, DOC_TYPES, DOC_TYPE_LABELS
+from intake import build_proposal, ProcessMatcher, DOC_TYPES, DOC_TYPE_LABELS
 from worker import Worker
 import utils_api
 
@@ -141,6 +141,12 @@ class TriageDialog(QDialog):
 
             ed_proc = QLineEdit(p.process_ref)
             ed_proc.editingFinished.connect(lambda r=i: self._reresolve(r))
+            if p.matched_by in ("fatura", "bl"):
+                label = "fatura" if p.matched_by == "fatura" else "BL"
+                hint = f"Processo deduzido pela {label}: {p.matched_via}"
+                ed_proc.setToolTip(hint)
+                ed_proc.setStyleSheet(f"border: 1px solid {T.ACCENT};")
+                it.setToolTip(f"{p.path}\n({hint})")
             self.table.setCellWidget(i, 1, ed_proc)
 
             cb_imp = QComboBox()
@@ -516,7 +522,11 @@ class MainWindow(QMainWindow):
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            proposals = [build_proposal(p, self._resolve_importer) for p in clean]
+            # casa por processo/fatura/BL usando o cache de processos do UTILS
+            matcher = ProcessMatcher(self.db.all_cached_processes())
+            proposals = [build_proposal(p, matcher=matcher,
+                                        resolver=self._resolve_importer)
+                         for p in clean]
         finally:
             QApplication.restoreOverrideCursor()
 
