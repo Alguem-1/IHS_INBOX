@@ -28,12 +28,13 @@ def _tokens(text) -> set:
 # Tipos canônicos do INBOX. Os que coincidem com o IHS_UTILS usam a MESMA chave
 # (INVOICE / PACKING_LIST / BL), p/ um futuro checklist mapear limpo.
 DOC_TYPES = [
-    "INVOICE", "PACKING_LIST", "BL", "DI", "CAPA", "FECHAMENTO",
-    "EXTRATO", "CI", "SEGURO", "CERTIFICADO", "OUTRO",
+    "INVOICE", "NOTA_FISCAL", "PACKING_LIST", "BL", "DI", "CAPA", "FECHAMENTO",
+    "EXTRATO", "CI", "SEGURO", "PHYTO_CERTIFICATE", "CERTIFICADO", "OUTRO",
 ]
 
 DOC_TYPE_LABELS = {
     "INVOICE": "Invoice",
+    "NOTA_FISCAL": "Nota Fiscal",
     "PACKING_LIST": "Packing List",
     "BL": "B/L (Conhecimento)",
     "DI": "DI / DUIMP",
@@ -42,6 +43,7 @@ DOC_TYPE_LABELS = {
     "EXTRATO": "Extrato",
     "CI": "CI",
     "SEGURO": "Seguro",
+    "PHYTO_CERTIFICATE": "Certificado Fitossanitário",
     "CERTIFICADO": "Certificado",
     "OUTRO": "Outro",
 }
@@ -50,13 +52,16 @@ DOC_TYPE_LABELS = {
 _KEYWORDS = [
     ("PACKING_LIST", ("packing", "romaneio", " pl", "pl_", "_pl")),
     ("INVOICE", ("invoice", "fatura", "comercial", "_inv", "inv_")),
+    ("NOTA_FISCAL", ("nota fiscal", "nota_fiscal", "notafiscal", " nf", "_nf", "-nf")),
     ("BL", ("bill of lading", "conhecimento", "awb", " bl", "bl_", "_bl", "b-l", "b_l")),
     ("DI", ("duimp", "declaracao", "declaração", " di", "di_", "_di")),
     ("FECHAMENTO", ("fechamento", "fech")),
     ("CAPA", ("capa",)),
     ("EXTRATO", ("extrato",)),
     ("SEGURO", ("seguro", "apolice", "apólice", "insurance")),
-    ("CERTIFICADO", ("certificad", "certificate", "fito", "phyto", "origem")),
+    # phyto ANTES do certificado genérico (mais específico vence)
+    ("PHYTO_CERTIFICATE", ("fitossanit", "phytosanit", "fito", "phyto")),
+    ("CERTIFICADO", ("certificad", "certificate", "origem")),
     ("CI", (" ci", "ci_", "_ci")),
 ]
 
