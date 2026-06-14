@@ -134,7 +134,9 @@ class TriageDialog(QDialog):
     def _fill(self):
         self.table.setRowCount(len(self.proposals))
         for i, p in enumerate(self.proposals):
-            it = QTableWidgetItem(p.original_name)
+            # mostra o subcaminho que será preservado dentro da pasta do processo
+            disp = f"{p.subdir}/{p.original_name}" if p.subdir else p.original_name
+            it = QTableWidgetItem(disp)
             it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
             it.setToolTip(p.path)
             self.table.setItem(i, 0, it)
@@ -186,7 +188,7 @@ class TriageDialog(QDialog):
             ref = self.table.cellWidget(i, 1).text().strip().upper()
             imp = self.table.cellWidget(i, 2).currentText().strip()
             dtype = self.table.cellWidget(i, 3).currentData()
-            self.result_rows.append((p.path, ref, imp, dtype))
+            self.result_rows.append((p.path, ref, imp, dtype, p.subdir))
         self.accept()
 
 
@@ -355,8 +357,7 @@ class MainWindow(QMainWindow):
         lay.setSpacing(10)
 
         # estado da navegação: importadores → processos → documentos
-        self._lib_importer = None
-        self._lib_folder = None
+        self._lib_path = []      # componentes abaixo da raiz (profundidade livre)
         self._lib_search = ""
 
         bar = QHBoxLayout()
@@ -630,24 +631,32 @@ class MainWindow(QMainWindow):
         dlg = FolderPickDialog(entries, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        files = []
+        # Reúne os arquivos das subpastas marcadas, guardando o subcaminho que
+        # deve ser PRESERVADO dentro da pasta do processo (ex.: 'Docs finais/').
+        files, subdir_of = [], {}
         for i in dlg.selected_indices:
             e = entries[i]
             if e["loose"]:
-                files += [str(p) for p in e["path"].iterdir()
-                          if p.is_file() and not p.name.startswith(".")]
+                for p in e["path"].iterdir():
+                    if p.is_file() and not p.name.startswith("."):
+                        files.append(str(p)); subdir_of[str(p)] = ""
             else:
-                files += [str(p) for p in e["path"].rglob("*")
-                          if p.is_file() and not p.name.startswith(".")]
+                base = e["path"]
+                for p in base.rglob("*"):
+                    if p.is_file() and not p.name.startswith("."):
+                        sd = p.relative_to(base).parent.as_posix()
+                        files.append(str(p))
+                        subdir_of[str(p)] = "" if sd == "." else sd
         if not files:
             QMessageBox.information(
                 self, "Nada selecionado",
                 "Nenhuma subpasta marcada — nada foi arquivado.")
             return
-        self._start_archive(files)
+        self._start_archive(files, subdir_of)
 
-    def _start_archive(self, paths):
+    def _start_archive(self, paths, subdir_of=None):
         root = str(Path(self.library_root).resolve())
+        subdir_of = subdir_of or {}
         clean = []
         for p in paths:
             try:
@@ -666,9 +675,12 @@ class MainWindow(QMainWindow):
         try:
             # casa por processo/fatura/BL usando o cache de processos do UTILS
             matcher = ProcessMatcher(self.db.all_cached_processes())
-            proposals = [build_proposal(p, matcher=matcher,
-                                        resolver=self._resolve_importer)
-                         for p in clean]
+            proposals = []
+            for p in clean:
+                prop = build_proposal(p, matcher=matcher,
+                                      resolver=self._resolve_importer)
+                prop.subdir = subdir_of.get(p, "")
+                proposals.append(prop)
         finally:
             QApplication.restoreOverrideCursor()
 
@@ -683,11 +695,11 @@ class MainWindow(QMainWindow):
 
         def task():
             out, errors = [], []
-            for path, ref, imp, dtype in rows:
+            for path, ref, imp, dtype, subdir in rows:
                 if not Path(path).exists():
                     continue
                 try:
-                    out.append(lib.commit(path, imp, ref, dtype))
+                    out.append(lib.commit(path, imp, ref, dtype, subdir=subdir))
                 except Exception as e:
                     # move seguro falhou → origem preservada; segue os demais
                     errors.append(f"{Path(path).name}: {e}")
@@ -758,11 +770,7 @@ class MainWindow(QMainWindow):
     def _lib_level(self):
         if self._lib_search:
             return "busca"
-        if self._lib_importer is None:
-            return "importadores"
-        if self._lib_folder is None:
-            return "processos"
-        return "documentos"
+        return "importadores" if not self._lib_path else "navegar"
 
     def _lib_dirs(self, path, exclude=()):
         try:
@@ -787,12 +795,7 @@ class MainWindow(QMainWindow):
 
     def _lib_cur_folder(self):
         """Pasta no disco do nível atual (p/ o botão 'Abrir pasta')."""
-        root = self.lib.root
-        if self._lib_importer is None:
-            return root
-        if self._lib_folder is None:
-            return root / self._lib_importer
-        return root / self._lib_importer / self._lib_folder
+        return self.lib.root.joinpath(*self._lib_path)
 
     def _lib_run_search(self):
         self._lib_search = self.f_text.text().strip()
@@ -802,10 +805,8 @@ class MainWindow(QMainWindow):
         if self._lib_search:
             self._lib_search = ""
             self.f_text.clear()
-        elif self._lib_folder is not None:
-            self._lib_folder = None
-        elif self._lib_importer is not None:
-            self._lib_importer = None
+        elif self._lib_path:
+            self._lib_path.pop()
         self._lib_reload()
 
     def _lib_open_folder(self):
@@ -836,13 +837,9 @@ class MainWindow(QMainWindow):
         elif level == "importadores":
             self.lib_crumb.setText("Biblioteca")
             self._lib_render_importers()
-        elif level == "processos":
-            self.lib_crumb.setText(f"Biblioteca  ›  {self._lib_importer}")
-            self._lib_render_dirs(self.lib.root / self._lib_importer, "processo")
         else:
-            self.lib_crumb.setText(
-                f"Biblioteca  ›  {self._lib_importer}  ›  {self._lib_folder}")
-            self._lib_render_docs(self._lib_importer, self._lib_folder)
+            self.lib_crumb.setText("Biblioteca  ›  " + "  ›  ".join(self._lib_path))
+            self._lib_render_browse(self._lib_path)
 
     def _set_dir_row(self, i, name, count_text):
         it = QTableWidgetItem(f"📁  {name}")
@@ -858,42 +855,48 @@ class MainWindow(QMainWindow):
             n = self._count_docs(self.lib.root / name, recursive=True)
             self._set_dir_row(i, name, f"{n} doc(s)")
         self.info.setText(
-            f"{len(names)} importador(es). Abra um (duplo-clique) para ver os processos.")
+            f"{len(names)} importador(es). Abra um (duplo-clique) para entrar.")
 
-    def _lib_render_dirs(self, parent, kind):
-        names = self._lib_dirs(parent)
-        self._setup_cols([f"Pasta ({kind})", "Conteúdo"], 0)
-        self.results.setRowCount(len(names))
-        for i, name in enumerate(names):
-            n = self._count_docs(parent / name, recursive=False)
-            self._set_dir_row(i, name, f"{n} doc(s)")
-        self.info.setText(
-            f"{len(names)} pasta(s). Abra uma (duplo-clique) para ver os documentos.")
-
-    def _lib_render_docs(self, importer, folder):
-        folder_abs = self.lib.root / importer / folder
+    def _lib_render_browse(self, parts):
+        """Conteúdo de uma pasta abaixo da raiz: subpastas (abríveis) + documentos
+        (pré-visualizáveis). Lida com pastas de processo que têm subpastas dentro
+        (ex.: 'Docs finais/'), em qualquer profundidade."""
+        folder_abs = self.lib.root.joinpath(*parts)
         try:
-            files = sorted([p for p in folder_abs.iterdir()
-                            if p.is_file() and not p.name.startswith(".")],
-                           key=lambda p: p.name.lower())
+            children = [p for p in folder_abs.iterdir() if not p.name.startswith(".")]
         except OSError:
-            files = []
-        self._setup_cols(["Arquivo", "Tipo", "Status", "Tamanho"], 0)
-        self.results.setRowCount(len(files))
-        for i, p in enumerate(files):
-            rel = f"{importer}/{folder}/{p.name}"
-            r = self.db.get_by_rel_path(rel)
-            dtype = DOC_TYPE_LABELS.get(r["doc_type"], r["doc_type"] or "") if r else ""
-            status = r["status"] if r else "(fora do índice)"
-            size = r["size_bytes"] if r else p.stat().st_size
-            it = QTableWidgetItem(f"📄  {p.name}")
-            it.setData(Qt.ItemDataRole.UserRole, ("doc", str(p)))
-            it.setData(Qt.ItemDataRole.UserRole + 1, r["id"] if r else None)
-            self.results.setItem(i, 0, it)
-            self.results.setItem(i, 1, QTableWidgetItem(dtype))
-            self.results.setItem(i, 2, QTableWidgetItem(status))
-            self.results.setItem(i, 3, QTableWidgetItem(human_size(size)))
-        self.info.setText(f"{len(files)} documento(s) nesta pasta. Clique para pré-visualizar.")
+            children = []
+        children.sort(key=lambda p: (p.is_file(), p.name.lower()))   # pastas primeiro
+        rel_prefix = "/".join(parts)
+        self._setup_cols(["Nome", "Tipo", "Status", "Tamanho"], 0)
+        self.results.setRowCount(len(children))
+        ndir = nfile = 0
+        for i, p in enumerate(children):
+            if p.is_dir():
+                ndir += 1
+                n = self._count_docs(p, recursive=True)
+                it = QTableWidgetItem(f"📁  {p.name}")
+                it.setData(Qt.ItemDataRole.UserRole, ("dir", p.name))
+                self.results.setItem(i, 0, it)
+                self.results.setItem(i, 1, QTableWidgetItem("pasta"))
+                self.results.setItem(i, 2, QTableWidgetItem(f"{n} doc(s)"))
+                self.results.setItem(i, 3, QTableWidgetItem("—"))
+            else:
+                nfile += 1
+                rel = f"{rel_prefix}/{p.name}"
+                r = self.db.get_by_rel_path(rel)
+                dtype = DOC_TYPE_LABELS.get(r["doc_type"], r["doc_type"] or "") if r else ""
+                status = r["status"] if r else "(fora do índice)"
+                size = r["size_bytes"] if r else p.stat().st_size
+                it = QTableWidgetItem(f"📄  {p.name}")
+                it.setData(Qt.ItemDataRole.UserRole, ("doc", str(p)))
+                it.setData(Qt.ItemDataRole.UserRole + 1, r["id"] if r else None)
+                self.results.setItem(i, 0, it)
+                self.results.setItem(i, 1, QTableWidgetItem(dtype))
+                self.results.setItem(i, 2, QTableWidgetItem(status))
+                self.results.setItem(i, 3, QTableWidgetItem(human_size(size)))
+        self.info.setText(f"{ndir} pasta(s), {nfile} documento(s). "
+                          "Clique num documento para pré-visualizar.")
 
     def _lib_render_search(self, query):
         rows = self.db.search(text=query)
@@ -928,10 +931,7 @@ class MainWindow(QMainWindow):
     def _lib_open_row(self, *args):
         kind, payload, _ = self._lib_selected()
         if kind == "dir":
-            if self._lib_importer is None:
-                self._lib_importer = payload
-            elif self._lib_folder is None:
-                self._lib_folder = payload
+            self._lib_path.append(payload)
             self._lib_reload()
         elif kind == "doc":
             open_path(payload)

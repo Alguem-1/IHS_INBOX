@@ -152,6 +152,7 @@ class Proposal:
     importer_resolved: bool = False   # True se o importador veio do UTILS/cache
     matched_by: str = ""              # como o processo foi achado (processo/fatura/bl)
     matched_via: str = ""             # o identificador que casou
+    subdir: str = ""                  # subcaminho a preservar dentro da pasta do processo
 
 
 def build_proposal(path: str, matcher=None, resolver=None) -> Proposal:

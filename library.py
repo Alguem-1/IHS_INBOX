@@ -210,7 +210,7 @@ class Library:
 
     # ── ingestão ──────────────────────────────────────────────────
     def commit(self, src_path: str, importer: str, process_ref: str,
-               doc_type: str, sha256: str = None) -> IngestResult:
+               doc_type: str, sha256: str = None, subdir: str = "") -> IngestResult:
         src = Path(src_path)
         original_name = src.name
         if sha256 is None:
@@ -242,6 +242,10 @@ class Library:
         # Move pra Importador/Processo/ (nome enriquecido ref_fatura_bl quando
         # o cache do UTILS tiver fatura/BL; reusa a pasta já existente do processo).
         folder = self.process_dir(importer, process_ref, create=True)
+        # Preserva a subestrutura de pastas que veio junto (ex.: 'Docs finais/').
+        if subdir:
+            folder = folder.joinpath(*[_safe_name(part) for part in Path(subdir).parts])
+            folder.mkdir(parents=True, exist_ok=True)
         dest = self._unique_dest(folder, original_name)
         size = src.stat().st_size
         safe_move(src, dest, sha256)
