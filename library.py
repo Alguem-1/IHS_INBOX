@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+from intake import extract_process_ref, guess_doc_type
+
 _CHUNK = 1024 * 1024  # 1 MiB
 
 QUARANTINE = "_duplicados"   # pasta reservada (não é importador)
@@ -287,3 +289,92 @@ class Library:
             self.db.remove_document(res.doc_id)
         self.db.log("undo", res.sha256, str(cur), str(dest), f"desfez {res.status}")
         return True
+
+    # ── reindexação a partir do disco ─────────────────────────────
+    def reindex_from_disk(self, report=None, is_canceled=None) -> dict:
+        """Reconstrói o índice a partir dos arquivos REAIS no disco, preservando
+        os metadados (tipo/status/notas) das entradas que continuam batendo.
+        Pensado p/ setups multi-PC: os documentos chegam por sync externo
+        (Nextcloud) e nunca passaram pela triagem do INBOX nesta máquina, então o
+        índice local fica defasado em relação ao que está na pasta.
+
+        Reconcilia, não zera:
+          - arquivo já indexado (mesmo rel_path)   → mantém (barato, sem hash)
+          - arquivo com hash conhecido (movido)     → reaponta, PRESERVA metadados
+          - arquivo novo                            → indexa (palpita o tipo p/ nome)
+          - linha do índice sem arquivo no disco     → remove (órfã)
+
+        `report(feitos, total, rótulo)` e `is_canceled()` são opcionais (UI).
+        Cancelar é seguro: para de indexar, mas NÃO remove órfãs (evita apagar
+        entradas válidas que ainda não foram varridas)."""
+        result = {"added": 0, "rebound": 0, "kept": 0, "removed": 0,
+                  "duplicates": 0, "canceled": False}
+
+        # 1) varre o disco (ignora ocultos e a quarentena de duplicados)
+        files = []
+        for p in self.root.rglob("*"):
+            rel_parts = p.relative_to(self.root).parts
+            if any(part.startswith(".") for part in rel_parts):
+                continue
+            if rel_parts and rel_parts[0] == QUARANTINE:
+                continue
+            if p.is_file():
+                files.append(p)
+        files.sort(key=lambda x: x.as_posix().lower())
+        total = len(files)
+
+        seen_ids = set()
+        for i, p in enumerate(files):
+            if is_canceled and is_canceled():
+                result["canceled"] = True
+                break
+            if report:
+                report(i, total, p.name)
+            rel = self._rel(p)
+            existing = self.db.get_by_rel_path(rel)
+            if existing:                       # já indexado neste lugar
+                seen_ids.add(existing["id"])
+                result["kept"] += 1
+                continue
+            # caminho novo: precisa do hash p/ distinguir "movido" de "novo"
+            try:
+                sha = sha256_of(str(p))
+                size = p.stat().st_size
+            except OSError:
+                continue
+            parts = rel.split("/")
+            importer = parts[0] if len(parts) >= 2 else ""
+            process_ref = (extract_process_ref(parts[1]) or "") if len(parts) >= 3 else ""
+            by_hash = self.db.find_by_hash(sha)
+            if by_hash:
+                if by_hash["id"] in seen_ids:  # mesmo conteúdo já casado nesta passada
+                    result["duplicates"] += 1
+                    continue
+                self.db.reindex_rebind(
+                    by_hash["id"], rel_path=rel, importer=importer,
+                    process_ref=process_ref, size_bytes=size,
+                    original_name=p.name)
+                seen_ids.add(by_hash["id"])
+                result["rebound"] += 1
+            else:
+                doc_id = self.db.add_document(
+                    sha256=sha, rel_path=rel, original_name=p.name,
+                    doc_type=guess_doc_type(p.name), process_ref=process_ref,
+                    importer=importer, size_bytes=size)
+                seen_ids.add(doc_id)
+                result["added"] += 1
+
+        # 2) remove órfãs (no índice, mas sumiram do disco). NUNCA se cancelou —
+        # seen_ids estaria incompleto e apagaria entradas válidas.
+        if not result["canceled"]:
+            if report:
+                report(total, total, "limpando índice…")
+            stale = set(self.db.all_document_ids()) - seen_ids
+            result["removed"] = self.db.remove_documents(stale)
+
+        self.db.log(
+            "reindex", "", str(self.root), "",
+            f"+{result['added']} mov{result['rebound']} ={result['kept']} "
+            f"-{result['removed']} dup{result['duplicates']}"
+            + (" (cancelado)" if result["canceled"] else ""))
+        return result

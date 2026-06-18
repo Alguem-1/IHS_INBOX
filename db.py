@@ -1,13 +1,24 @@
 """
-db.py — Índice SQLite do IHS_INBOX. Fica em <raiz_da_biblioteca>/.ihs_inbox.db
-para viajar junto com a biblioteca (os caminhos são RELATIVOS à raiz).
+db.py — Índice SQLite do IHS_INBOX. Mora em ~/.ihs_inbox/index.db (LOCAL da
+máquina), FORA da biblioteca de documentos: assim o índice não é sincronizado
+junto com os arquivos (Nextcloud etc.) — SQLite ao vivo não tolera sync
+concorrente e corromperia. Os rel_path são RELATIVOS à raiz da biblioteca, então
+cada máquina mantém o próprio índice; use "Reindexar do disco" p/ reconstruí-lo a
+partir dos arquivos que o sync entregou.
+
+(Versões antigas guardavam o índice em <raiz_da_biblioteca>/.ihs_inbox.db; ele é
+migrado automaticamente p/ o novo local na 1ª abertura.)
 
 Guarda só METADADOS de organização — nunca conteúdo fiscal interpretado.
 """
 
+import shutil
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+
+# Índice local da máquina (fora da pasta sincronizada da biblioteca).
+_DB_DIR = Path.home() / ".ihs_inbox"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -61,13 +72,30 @@ class DB:
     def __init__(self, library_root: str):
         self.library_root = Path(library_root)
         self.library_root.mkdir(parents=True, exist_ok=True)
-        self.path = self.library_root / ".ihs_inbox.db"
+        _DB_DIR.mkdir(parents=True, exist_ok=True)
+        self.path = _DB_DIR / "index.db"
+        self._migrate_legacy_db()
         # check_same_thread=False: o acesso é serializado pela app (a UI espera
         # o worker terminar), então é seguro tocar o índice da thread de rede/hash.
         self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
+
+    def _migrate_legacy_db(self):
+        """Move o índice antigo (<raiz>/.ihs_inbox.db, que era sincronizado junto
+        com a biblioteca e arriscava conflito/corrupção) p/ o novo local
+        local-da-máquina. Roda uma única vez (só se o novo ainda não existe)."""
+        legacy = self.library_root / ".ihs_inbox.db"
+        if self.path.exists() or not legacy.exists():
+            return
+        try:
+            shutil.move(str(legacy), str(self.path))
+        except OSError:
+            try:                       # em uso/sem permissão: ao menos copia
+                shutil.copy2(str(legacy), str(self.path))
+            except OSError:
+                pass
 
     def close(self):
         self.conn.close()
@@ -91,6 +119,31 @@ class DB:
 
     def remove_document(self, doc_id: int) -> None:
         self.conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        self.conn.commit()
+
+    def remove_documents(self, ids) -> int:
+        """Remove várias linhas de uma vez (reindexação: tira as órfãs)."""
+        ids = list(ids)
+        if not ids:
+            return 0
+        self.conn.executemany(
+            "DELETE FROM documents WHERE id = ?", [(i,) for i in ids])
+        self.conn.commit()
+        return len(ids)
+
+    def all_document_ids(self) -> list[int]:
+        return [r["id"] for r in
+                self.conn.execute("SELECT id FROM documents").fetchall()]
+
+    def reindex_rebind(self, doc_id, *, rel_path, importer, process_ref,
+                       size_bytes, original_name) -> None:
+        """Reaponta uma linha existente p/ um novo rel_path (mesmo conteúdo movido
+        no disco): atualiza local/importador/processo/tamanho/nome, mas PRESERVA
+        doc_type, status e notas que o humano já definiu."""
+        self.conn.execute(
+            "UPDATE documents SET rel_path=?, importer=?, process_ref=?, "
+            "size_bytes=?, original_name=? WHERE id=?",
+            (rel_path, importer, process_ref, size_bytes, original_name, doc_id))
         self.conn.commit()
 
     def get_document(self, doc_id: int):

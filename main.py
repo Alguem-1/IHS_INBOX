@@ -395,11 +395,18 @@ class MainWindow(QMainWindow):
         self.lib_crumb.setStyleSheet(T.LBL_SECTION)
         self.btn_lib_openfolder = QPushButton("Abrir pasta")
         self.btn_lib_openfolder.clicked.connect(self._lib_open_folder)
+        b_reindex = QPushButton("Reindexar do disco")
+        b_reindex.setToolTip(
+            "Reconstrói o índice de busca a partir dos arquivos no disco — útil "
+            "quando documentos chegam por sincronização (Nextcloud) e não pela "
+            "triagem. Preserva tipos e status já definidos.")
+        b_reindex.clicked.connect(self._reindex_from_disk)
         b_refresh = QPushButton("Atualizar")
         b_refresh.clicked.connect(self._lib_reload)
         nav.addWidget(self.btn_lib_back)
         nav.addWidget(self.lib_crumb, 1)
         nav.addWidget(self.btn_lib_openfolder)
+        nav.addWidget(b_reindex)
         nav.addWidget(b_refresh)
         lay.addLayout(nav)
 
@@ -840,6 +847,49 @@ class MainWindow(QMainWindow):
         if dlg is not None:
             dlg.close()
             self._progress_dlg = None
+
+    # ---- reindexação a partir do disco (setups multi-PC / sync externo) ----
+    def _reindex_from_disk(self):
+        q = QMessageBox.question(
+            self, "Reindexar do disco",
+            "Varre toda a biblioteca no disco e reconstrói o índice de busca a "
+            "partir dos arquivos que estão realmente lá — útil quando documentos "
+            "chegaram por sincronização (Nextcloud) e não pela triagem.\n\n"
+            "Tipos e status já definidos são preservados; entradas cujo arquivo "
+            "sumiu do disco saem do índice.\n\nContinuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if q != QMessageBox.StandardButton.Yes:
+            return
+        # total só é sabido depois de varrer o disco → barra indeterminada no início
+        cancel = self._make_progress("Reindexar do disco", 0, "Lendo")
+
+        def task(report):
+            return self.lib.reindex_from_disk(
+                report, is_canceled=lambda: cancel["flag"])
+
+        self._run(task, self._on_reindex_done, self._on_reindex_fail,
+                  on_progress=self._on_progress)
+
+    def _on_reindex_fail(self, e):
+        self._close_progress()
+        QMessageBox.critical(self, "Erro", f"Falha ao reindexar: {e}")
+
+    def _on_reindex_done(self, res):
+        self._close_progress()
+        self._log_recent(
+            f"Reindex: +{res['added']} novo(s), {res['rebound']} movido(s), "
+            f"{res['kept']} mantido(s), -{res['removed']} órfã(s)"
+            + (" (cancelado)" if res["canceled"] else ""))
+        titulo = "Reindexação cancelada" if res["canceled"] else "Reindexação concluída"
+        QMessageBox.information(
+            self, titulo,
+            f"• {res['added']} novo(s) indexado(s)\n"
+            f"• {res['rebound']} reapontado(s) (arquivo movido)\n"
+            f"• {res['kept']} já estavam no índice\n"
+            f"• {res['removed']} removido(s) do índice (sumiram do disco)\n"
+            f"• {res['duplicates']} cópia(s) idêntica(s) ignorada(s)")
+        self._lib_reload()
 
     def _on_archive_fail(self, e):
         self._close_progress()
