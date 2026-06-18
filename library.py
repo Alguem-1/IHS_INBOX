@@ -291,7 +291,8 @@ class Library:
         return True
 
     # ── reindexação a partir do disco ─────────────────────────────
-    def reindex_from_disk(self, report=None, is_canceled=None) -> dict:
+    def reindex_from_disk(self, report=None, is_canceled=None,
+                          remove_orphans=True) -> dict:
         """Reconstrói o índice a partir dos arquivos REAIS no disco, preservando
         os metadados (tipo/status/notas) das entradas que continuam batendo.
         Pensado p/ setups multi-PC: os documentos chegam por sync externo
@@ -306,7 +307,12 @@ class Library:
 
         `report(feitos, total, rótulo)` e `is_canceled()` são opcionais (UI).
         Cancelar é seguro: para de indexar, mas NÃO remove órfãs (evita apagar
-        entradas válidas que ainda não foram varridas)."""
+        entradas válidas que ainda não foram varridas).
+
+        `remove_orphans=False` → passe ADITIVO (usado no reindex automático em
+        background): indexa o novo e reaponta movidos, mas nunca remove nada —
+        seguro mesmo com o Nextcloud no meio de uma sincronização (arquivo
+        temporariamente ausente não seria apagado do índice)."""
         result = {"added": 0, "rebound": 0, "kept": 0, "removed": 0,
                   "duplicates": 0, "canceled": False}
 
@@ -364,17 +370,20 @@ class Library:
                 seen_ids.add(doc_id)
                 result["added"] += 1
 
-        # 2) remove órfãs (no índice, mas sumiram do disco). NUNCA se cancelou —
-        # seen_ids estaria incompleto e apagaria entradas válidas.
-        if not result["canceled"]:
+        # 2) remove órfãs (no índice, mas sumiram do disco). Só no modo completo e
+        # se não cancelou — no aditivo (arranque/sync) ou cancelado, seen_ids está
+        # incompleto e apagaria entradas válidas ainda não varridas.
+        if remove_orphans and not result["canceled"]:
             if report:
                 report(total, total, "limpando índice…")
             stale = set(self.db.all_document_ids()) - seen_ids
             result["removed"] = self.db.remove_documents(stale)
 
-        self.db.log(
-            "reindex", "", str(self.root), "",
-            f"+{result['added']} mov{result['rebound']} ={result['kept']} "
-            f"-{result['removed']} dup{result['duplicates']}"
-            + (" (cancelado)" if result["canceled"] else ""))
+        # Só registra na auditoria se algo mudou (não polui o log a cada arranque).
+        if result["added"] or result["rebound"] or result["removed"]:
+            self.db.log(
+                "reindex", "", str(self.root), "",
+                f"+{result['added']} mov{result['rebound']} ={result['kept']} "
+                f"-{result['removed']} dup{result['duplicates']}"
+                + (" (cancelado)" if result["canceled"] else ""))
         return result

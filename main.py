@@ -11,7 +11,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtCore import Qt, QUrl, QTimer
 from PyQt6.QtGui import QPixmap, QImage, QIcon, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
@@ -297,10 +297,14 @@ class MainWindow(QMainWindow):
         self.utils_client = None
         self.last_results = []   # IngestResult da última leva (p/ undo)
         self._workers = []
+        self._reindexing = False
+        self._closing = False
+        self._last_reindex_ts = None
 
         self._build_ui()
         self._refresh_status()
         self._prompt_utils_login()   # login opcional + sync no arranque
+        self._auto_reindex()         # reconciliação aditiva do índice em background
 
     # ---- construção da UI ----
     def _build_ui(self):
@@ -325,6 +329,27 @@ class MainWindow(QMainWindow):
         self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
 
         self.setCentralWidget(self.tabs)
+        self._setup_index_status()
+
+    def _setup_index_status(self):
+        """Barra de status (rodapé): indicador discreto do reindex em background.
+        Spinner girando enquanto roda; some sozinho quando termina (ou mostra
+        '+N do disco' por uns segundos). Animado por QTimer, sem travar a UI."""
+        sb = self.statusBar()
+        sb.setSizeGripEnabled(False)
+        sb.setStyleSheet(
+            f"QStatusBar {{ background: {T.BG_PANEL}; "
+            f"border-top: 1px solid {T.BORDER}; }}"
+            "QStatusBar::item { border: 0; }")
+        self._idx_label = QLabel("")
+        self._idx_label.setStyleSheet(T.LBL_HINT)
+        sb.addWidget(self._idx_label)
+        self._spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self._spin_i = 0
+        self._spin_msg = ""
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(110)
+        self._spin_timer.timeout.connect(self._spin_tick)
 
     def _build_triage_tab(self):
         w = QWidget()
@@ -891,6 +916,67 @@ class MainWindow(QMainWindow):
             f"• {res['duplicates']} cópia(s) idêntica(s) ignorada(s)")
         self._lib_reload()
 
+    # ---- reindex automático em background (arranque + entrada na Biblioteca) ----
+    def _spin_tick(self):
+        self._spin_i = (self._spin_i + 1) % len(self._spin_frames)
+        self._idx_label.setText(
+            f"{self._spin_frames[self._spin_i]}  {self._spin_msg}")
+
+    def _start_spin(self, msg):
+        self._spin_msg = msg
+        self._spin_i = 0
+        self._idx_label.setStyleSheet(T.LBL_HINT)
+        self._idx_label.setText(f"{self._spin_frames[0]}  {msg}")
+        self._spin_timer.start()
+
+    def _stop_spin(self, msg="", ok=True, hold_ms=6000):
+        self._spin_timer.stop()
+        if not msg:
+            self._idx_label.setText("")
+            return
+        color = T.GREEN if ok else T.YELLOW
+        self._idx_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+        self._idx_label.setText(msg)
+        # limpa depois de um tempo, sem apagar uma mensagem mais nova que chegou
+        QTimer.singleShot(hold_ms, lambda: (
+            self._idx_label.setText(""),
+            self._idx_label.setStyleSheet(T.LBL_HINT)
+        ) if self._idx_label.text() == msg else None)
+
+    def _auto_reindex(self, throttle_s=0):
+        """Reconciliação ADITIVA do índice em background (não remove órfãs), sem
+        travar a UI — pega o que o sync (Nextcloud) trouxe. `throttle_s` pula se
+        já rodou há pouco (usado ao entrar na aba Biblioteca)."""
+        if self._reindexing:
+            return
+        if throttle_s and self._last_reindex_ts is not None:
+            if (datetime.now() - self._last_reindex_ts).total_seconds() < throttle_s:
+                return
+        self._reindexing = True
+        self._start_spin("Indexando do disco…")
+        self._run(
+            lambda: self.lib.reindex_from_disk(
+                remove_orphans=False, is_canceled=lambda: self._closing),
+            self._on_auto_reindex_done, self._on_auto_reindex_fail)
+
+    def _on_auto_reindex_done(self, res):
+        self._reindexing = False
+        self._last_reindex_ts = datetime.now()
+        novos = res["added"] + res["rebound"]
+        if novos > 0:
+            self._stop_spin(f"✓ Índice atualizado · +{novos} do disco")
+            self._log_recent(
+                f"Índice: +{res['added']} novo(s), {res['rebound']} movido(s) do disco.")
+            if self.tabs.currentIndex() == 1:   # já está na Biblioteca → reflete
+                self._lib_reload()
+        else:
+            self._stop_spin("Índice em dia", hold_ms=2500)
+
+    def _on_auto_reindex_fail(self, e):
+        self._reindexing = False
+        self._last_reindex_ts = datetime.now()
+        self._stop_spin("Falha ao indexar do disco", ok=False, hold_ms=4000)
+
     def _on_archive_fail(self, e):
         self._close_progress()
         QMessageBox.critical(self, "Erro", f"Falha ao arquivar: {e}")
@@ -1198,10 +1284,19 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, idx):
         if idx == 1:
             self._lib_reload()
+            self._auto_reindex(throttle_s=20)   # pega o que o sync trouxe entre visitas
         elif idx == 2:
             self._reload_audit()
 
     def closeEvent(self, e):
+        # Sinaliza cancelamento e espera os workers (ex.: reindex em background)
+        # terminarem antes de fechar o índice — senão tocariam uma conexão fechada.
+        self._closing = True
+        for wk in list(self._workers):
+            try:
+                wk.wait(3000)
+            except Exception:
+                pass
         try:
             self.db.close()
         except Exception:
