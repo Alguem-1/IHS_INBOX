@@ -162,20 +162,31 @@ class Library:
             folder.mkdir(parents=True, exist_ok=True)
         return folder
 
-    def sync_process_folders(self, processes) -> dict:
+    def sync_process_folders(self, processes, report=None, is_canceled=None) -> dict:
         """O botão. Para cada processo do UTILS, garante a pasta
         importador/REF[_fatura][_bl]: cria se faltar, RENOMEIA a pasta existente
         quando o nome enriquecido muda (e atualiza o rel_path dos documentos).
-        Idempotente. Nunca aborta o lote — erros por processo são acumulados."""
-        report = {"created": [], "renamed": [], "skipped": 0,
-                  "no_importer": 0, "errors": []}
-        for p in processes:
+        Idempotente. Nunca aborta o lote — erros por processo são acumulados.
+
+        `report(feitos, total, rótulo)` (opcional) emite progresso por processo;
+        `is_canceled()` (opcional) permite parar entre processos com segurança —
+        cada processo é tratado por inteiro (cria, ou renomeia+reparenta, ou nem
+        começa), então cancelar deixa a biblioteca consistente."""
+        result = {"created": [], "renamed": [], "skipped": 0,
+                  "no_importer": 0, "errors": [], "canceled": False}
+        total = len(processes)
+        for i, p in enumerate(processes):
+            if is_canceled and is_canceled():
+                result["canceled"] = True
+                break
             ref = (p["reference"] or "").strip().upper() if p["reference"] else ""
+            if report:
+                report(i, total, ref)
             if not ref:
                 continue
             importer = (p["importer"] or "").strip() if p["importer"] else ""
             if not importer:
-                report["no_importer"] += 1
+                result["no_importer"] += 1
                 continue
             try:
                 importer_dir = self.root / _safe_name(importer)
@@ -187,14 +198,14 @@ class Library:
                     target.mkdir(parents=True, exist_ok=True)
                     self.db.log("mkdir_process", "", "", str(target),
                                 f"{importer} / {ref}")
-                    report["created"].append(self._rel(target))
+                    result["created"].append(self._rel(target))
                 elif existing.name == desired:
-                    report["skipped"] += 1
+                    result["skipped"] += 1
                 else:
                     target = importer_dir / desired
                     if target.exists():
                         # colisão inesperada: não mexe, registra como erro leve.
-                        report["errors"].append(
+                        result["errors"].append(
                             f"{ref}: já existe '{desired}' (não renomeei)")
                         continue
                     old_rel = self._rel(existing)
@@ -203,10 +214,10 @@ class Library:
                     n = self.db.reparent_documents(old_rel, new_rel)
                     self.db.log("rename_process", "", str(existing), str(target),
                                 f"{importer} / {ref} ({n} docs)")
-                    report["renamed"].append((old_rel, new_rel))
+                    result["renamed"].append((old_rel, new_rel))
             except Exception as e:  # nunca derruba o lote
-                report["errors"].append(f"{ref}: {e}")
-        return report
+                result["errors"].append(f"{ref}: {e}")
+        return result
 
     # ── ingestão ──────────────────────────────────────────────────
     def commit(self, src_path: str, importer: str, process_ref: str,

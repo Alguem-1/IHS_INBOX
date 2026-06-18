@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QFileDialog, QMessageBox, QDialog, QSplitter, QScrollArea,
-    QAbstractItemView, QPlainTextEdit,
+    QAbstractItemView, QPlainTextEdit, QProgressDialog,
 )
 
 import config
@@ -460,8 +460,11 @@ class MainWindow(QMainWindow):
     def _log_recent(self, msg):
         self.recent.appendPlainText(f"[{datetime.now():%H:%M:%S}] {msg}")
 
-    def _run(self, fn, on_done=None, on_fail=None):
+    def _run(self, fn, on_done=None, on_fail=None, on_progress=None):
         wk = Worker(fn)
+        if on_progress:
+            wk.wants_progress = True
+            wk.progress.connect(on_progress)
         if on_done:
             wk.done.connect(on_done)
         if on_fail:
@@ -469,6 +472,7 @@ class MainWindow(QMainWindow):
         wk.finished.connect(lambda: self._workers.remove(wk) if wk in self._workers else None)
         self._workers.append(wk)
         wk.start()
+        return wk
 
     # ---- integração UTILS (só-leitura) ----
     def _resolve_importer(self, ref):
@@ -537,8 +541,12 @@ class MainWindow(QMainWindow):
         db = self.db
         lib = self.lib
 
-        def task():
+        cancel = self._make_progress("Criando/atualizando pastas", 0,
+                                     "Atualizando pasta")
+
+        def task(report):
             if client:   # online: atualiza o cache antes (igual ao _sync_cache)
+                report(0, 0, "Sincronizando processos do UTILS…")
                 procs = client.list_processes()
                 norm = [{
                     "reference": d.get("reference"),
@@ -550,17 +558,19 @@ class MainWindow(QMainWindow):
                     "di_number": d.get("di_number"),
                 } for d in procs if d.get("reference")]
                 db.upsert_processes(norm)
-            return lib.sync_process_folders(db.all_cached_processes())
+            return lib.sync_process_folders(
+                db.all_cached_processes(), report=report,
+                is_canceled=lambda: cancel["flag"])
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self._run(task, self._on_folders_done, self._on_folders_fail)
+        self._run(task, self._on_folders_done, self._on_folders_fail,
+                  on_progress=self._on_progress)
 
     def _on_folders_fail(self, e):
-        QApplication.restoreOverrideCursor()
+        self._close_progress()
         QMessageBox.critical(self, "Erro", f"Falha ao criar pastas: {e}")
 
     def _on_folders_done(self, report):
-        QApplication.restoreOverrideCursor()
+        self._close_progress()
         nc = len(report["created"])
         nr = len(report["renamed"])
         for rel in report["created"]:
@@ -573,13 +583,18 @@ class MainWindow(QMainWindow):
                f"{report['skipped']} já em dia.")
         if report["no_importer"]:
             msg += f"\n{report['no_importer']} processo(s) sem importador (omitidos)."
+        if report.get("canceled"):
+            msg = ("Operação cancelada — as pastas já criadas/renomeadas ficam; "
+                   "o resto não foi tocado.\n\n" + msg)
         if report["errors"]:
             msg += (f"\n\n{len(report['errors'])} aviso(s):\n- "
                     + "\n- ".join(report["errors"][:8]))
             if len(report["errors"]) > 8:
                 msg += f"\n… e mais {len(report['errors']) - 8}."
-        (QMessageBox.warning if report["errors"] else QMessageBox.information)(
-            self, "Pastas dos processos", msg)
+        (QMessageBox.warning if (report["errors"] or report.get("canceled"))
+         else QMessageBox.information)(
+            self, "Cancelado" if report.get("canceled") else "Pastas dos processos",
+            msg)
         self._lib_reload()
         self._reload_audit()
         self._refresh_status()
@@ -692,10 +707,22 @@ class MainWindow(QMainWindow):
 
     def _do_commit(self, rows):
         lib = self.lib
+        total = len(rows)
 
-        def task():
+        # Barra de progresso (em vez de só a bolinha do sistema): mostra "X de N"
+        # e o arquivo atual, com Cancelar. Cancelar é seguro — cada arquivo é
+        # movido atomicamente (copia → confere hash → apaga), então parar entre
+        # arquivos deixa a biblioteca consistente.
+        cancel = self._make_progress("Arquivando documentos", total, "Arquivando")
+
+        def task(report):
             out, errors = [], []
-            for path, ref, imp, dtype, subdir in rows:
+            canceled = False
+            for i, (path, ref, imp, dtype, subdir) in enumerate(rows):
+                if cancel["flag"]:
+                    canceled = True
+                    break
+                report(i, total, Path(path).name)
                 if not Path(path).exists():
                     continue
                 try:
@@ -703,18 +730,54 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     # move seguro falhou → origem preservada; segue os demais
                     errors.append(f"{Path(path).name}: {e}")
-            return out, errors
+            report(total, total, "")
+            return out, errors, canceled
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self._run(task, self._on_archive_done, self._on_archive_fail)
+        self._run(task, self._on_archive_done, self._on_archive_fail,
+                  on_progress=self._on_progress)
+
+    # ---- progresso reutilizável (arquivamento e criação de pastas) ----
+    def _make_progress(self, title, total, verb):
+        """Cria um QProgressDialog modal (guardado em self._progress_dlg) e
+        devolve um dict-flag de cancelamento que o trabalho na thread consulta.
+        total=0 → barra indeterminada (quando o total ainda não é conhecido)."""
+        dlg = QProgressDialog("Preparando…", "Cancelar", 0, total, self)
+        dlg.setWindowTitle(title)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(400)   # não pisca em levas rápidas
+        dlg.setValue(0)
+        self._progress_dlg = dlg
+        self._progress_verb = verb
+        cancel = {"flag": False}
+        dlg.canceled.connect(lambda: cancel.update(flag=True))
+        return cancel
+
+    def _on_progress(self, done, total, label):
+        dlg = getattr(self, "_progress_dlg", None)
+        if dlg is None:
+            return
+        if total > 0:
+            dlg.setMaximum(total)   # total às vezes só é sabido depois (sync)
+        dlg.setValue(done)
+        if label:
+            if total > 0:
+                dlg.setLabelText(f"{self._progress_verb} {done + 1} de {total}…\n{label}")
+            else:
+                dlg.setLabelText(label)   # fase indeterminada (ex.: sincronizando)
+
+    def _close_progress(self):
+        dlg = getattr(self, "_progress_dlg", None)
+        if dlg is not None:
+            dlg.close()
+            self._progress_dlg = None
 
     def _on_archive_fail(self, e):
-        QApplication.restoreOverrideCursor()
+        self._close_progress()
         QMessageBox.critical(self, "Erro", f"Falha ao arquivar: {e}")
 
     def _on_archive_done(self, payload):
-        QApplication.restoreOverrideCursor()
-        results, errors = payload
+        self._close_progress()
+        results, errors, canceled = payload
         self.last_results = results
         ing = sum(1 for r in results if r.status == "ingested")
         dup = sum(1 for r in results if r.status == "duplicate")
@@ -732,13 +795,16 @@ class MainWindow(QMainWindow):
         if dup:
             msg += (f" {dup} duplicado(s) movido(s) para _duplicados "
                     "(não duplicados na biblioteca).")
+        if canceled:
+            msg = ("Operação cancelada — o que já foi movido está na biblioteca, "
+                   "o resto continua na origem.\n\n" + msg)
         if errors:
             msg += (f"\n\n{len(errors)} falha(s) — a origem foi preservada:\n- "
                     + "\n- ".join(errors[:8]))
             if len(errors) > 8:
                 msg += f"\n… e mais {len(errors) - 8}."
-        (QMessageBox.warning if errors else QMessageBox.information)(
-            self, "Concluído", msg)
+        (QMessageBox.warning if (errors or canceled) else QMessageBox.information)(
+            self, "Cancelado" if canceled else "Concluído", msg)
         self._lib_reload()
         self._reload_audit()
         self._refresh_status()
