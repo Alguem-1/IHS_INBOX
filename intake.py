@@ -29,7 +29,8 @@ def _tokens(text) -> set:
 # (INVOICE / PACKING_LIST / BL), p/ um futuro checklist mapear limpo.
 DOC_TYPES = [
     "INVOICE", "NOTA_FISCAL", "PACKING_LIST", "BL", "DI", "CAPA", "FECHAMENTO",
-    "EXTRATO", "CI", "SEGURO", "PHYTO_CERTIFICATE", "CERTIFICADO", "OUTRO",
+    "EXTRATO", "CI", "SEGURO", "PHYTO_CERTIFICATE", "FUMIGATION", "CERTIFICADO",
+    "OUTRO",
 ]
 
 DOC_TYPE_LABELS = {
@@ -44,6 +45,7 @@ DOC_TYPE_LABELS = {
     "CI": "CI",
     "SEGURO": "Seguro",
     "PHYTO_CERTIFICATE": "Certificado Fitossanitário",
+    "FUMIGATION": "Certificado de Fumigação",
     "CERTIFICADO": "Certificado",
     "OUTRO": "Outro",
 }
@@ -59,8 +61,9 @@ _KEYWORDS = [
     ("CAPA", ("capa",)),
     ("EXTRATO", ("extrato",)),
     ("SEGURO", ("seguro", "apolice", "apólice", "insurance")),
-    # phyto ANTES do certificado genérico (mais específico vence)
+    # phyto e fumigação ANTES do certificado genérico (mais específico vence)
     ("PHYTO_CERTIFICATE", ("fitossanit", "phytosanit", "fito", "phyto")),
+    ("FUMIGATION", ("fumiga",)),   # fumigation / fumigação / fumigacao
     ("CERTIFICADO", ("certificad", "certificate", "origem")),
     ("CI", (" ci", "ci_", "_ci")),
 ]
