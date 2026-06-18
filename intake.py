@@ -28,9 +28,9 @@ def _tokens(text) -> set:
 # Tipos canônicos do INBOX. Os que coincidem com o IHS_UTILS usam a MESMA chave
 # (INVOICE / PACKING_LIST / BL), p/ um futuro checklist mapear limpo.
 DOC_TYPES = [
-    "INVOICE", "NOTA_FISCAL", "PACKING_LIST", "BL", "DI", "CAPA", "FECHAMENTO",
-    "EXTRATO", "CI", "SEGURO", "PHYTO_CERTIFICATE", "FUMIGATION", "CERTIFICADO",
-    "OUTRO",
+    "INVOICE", "NOTA_FISCAL", "PACKING_LIST", "BL", "DI", "DTA", "CAPA",
+    "FECHAMENTO", "EXTRATO", "AFRMM", "CI", "SEGURO", "PHYTO_CERTIFICATE",
+    "FUMIGATION", "CERTIFICADO", "OUTRO",
 ]
 
 DOC_TYPE_LABELS = {
@@ -39,9 +39,11 @@ DOC_TYPE_LABELS = {
     "PACKING_LIST": "Packing List",
     "BL": "B/L (Conhecimento)",
     "DI": "DI / DUIMP",
+    "DTA": "DTA",
     "CAPA": "Capa",
     "FECHAMENTO": "Fechamento",
     "EXTRATO": "Extrato",
+    "AFRMM": "AFRMM",
     "CI": "CI",
     "SEGURO": "Seguro",
     "PHYTO_CERTIFICATE": "Certificado Fitossanitário",
@@ -57,9 +59,12 @@ _KEYWORDS = [
     ("NOTA_FISCAL", ("nota fiscal", "nota_fiscal", "notafiscal", " nf", "_nf", "-nf")),
     ("BL", ("bill of lading", "conhecimento", "awb", " bl", "bl_", "_bl", "b-l", "b_l")),
     ("DI", ("duimp", "declaracao", "declaração", " di", "di_", "_di")),
+    # DTA/AFRMM: acrônimos com fronteira (espaço/_/-) p/ não dar falso positivo
+    ("DTA", (" dta", "dta_", "_dta", "dta-", "-dta")),
     ("FECHAMENTO", ("fechamento", "fech")),
     ("CAPA", ("capa",)),
     ("EXTRATO", ("extrato",)),
+    ("AFRMM", ("afrmm",)),
     ("SEGURO", ("seguro", "apolice", "apólice", "insurance")),
     # phyto e fumigação ANTES do certificado genérico (mais específico vence)
     ("PHYTO_CERTIFICATE", ("fitossanit", "phytosanit", "fito", "phyto")),
