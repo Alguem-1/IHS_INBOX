@@ -17,6 +17,16 @@ _CHUNK = 1024 * 1024  # 1 MiB
 
 QUARANTINE = "_duplicados"   # pasta reservada (não é importador)
 
+# Arquivos de conflito do Nextcloud/ownCloud. EXIGE a palavra "conflicted/conflict"
+# no padrão estruturado — nunca marca por "cópia"/"copy" sozinho (o usuário faz
+# cópias rápidas de propósito). Se o cliente um dia gerar sufixo localizado em
+# pt-BR, pegar uma amostra do nome real e só então acrescentar o padrão.
+_CONFLICT_RE = re.compile(r"\(conflicted copy[^)]*\)|_conflict-\d{6,}", re.IGNORECASE)
+
+
+def is_conflict_name(name: str) -> bool:
+    return bool(_CONFLICT_RE.search(name or ""))
+
 
 def sha256_of(path: str) -> str:
     h = hashlib.sha256()
@@ -312,9 +322,13 @@ class Library:
         `remove_orphans=False` → passe ADITIVO (usado no reindex automático em
         background): indexa o novo e reaponta movidos, mas nunca remove nada —
         seguro mesmo com o Nextcloud no meio de uma sincronização (arquivo
-        temporariamente ausente não seria apagado do índice)."""
+        temporariamente ausente não seria apagado do índice).
+
+        Também detecta arquivos de CONFLITO do Nextcloud (ver is_conflict_name):
+        marca o status deles como 'conflito' no índice e devolve a lista deles em
+        result["conflicts"] (rel_paths) p/ a UI avisar. Não apaga nada."""
         result = {"added": 0, "rebound": 0, "kept": 0, "removed": 0,
-                  "duplicates": 0, "canceled": False}
+                  "duplicates": 0, "canceled": False, "conflicts": []}
 
         # 1) varre o disco (ignora ocultos e a quarentena de duplicados)
         files = []
@@ -337,10 +351,15 @@ class Library:
             if report:
                 report(i, total, p.name)
             rel = self._rel(p)
+            is_conf = is_conflict_name(p.name)   # arquivo de conflito do Nextcloud?
+            if is_conf:
+                result["conflicts"].append(rel)
             existing = self.db.get_by_rel_path(rel)
             if existing:                       # já indexado neste lugar
                 seen_ids.add(existing["id"])
                 result["kept"] += 1
+                if is_conf and existing["status"] != "conflito":
+                    self.db.set_status(existing["id"], "conflito")
                 continue
             # caminho novo: precisa do hash p/ distinguir "movido" de "novo"
             try:
@@ -360,13 +379,16 @@ class Library:
                     by_hash["id"], rel_path=rel, importer=importer,
                     process_ref=process_ref, size_bytes=size,
                     original_name=p.name)
+                if is_conf:
+                    self.db.set_status(by_hash["id"], "conflito")
                 seen_ids.add(by_hash["id"])
                 result["rebound"] += 1
             else:
                 doc_id = self.db.add_document(
                     sha256=sha, rel_path=rel, original_name=p.name,
                     doc_type=guess_doc_type(p.name), process_ref=process_ref,
-                    importer=importer, size_bytes=size)
+                    importer=importer, size_bytes=size,
+                    status="conflito" if is_conf else "recebido")
                 seen_ids.add(doc_id)
                 result["added"] += 1
 

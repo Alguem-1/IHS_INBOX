@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QFileDialog, QMessageBox, QDialog, QSplitter, QScrollArea,
     QAbstractItemView, QPlainTextEdit, QProgressDialog,
+    QListWidget, QListWidgetItem,
 )
 
 import config
@@ -285,6 +286,71 @@ class FolderPickDialog(QDialog):
         self.accept()
 
 
+class ConflictsDialog(QDialog):
+    """Lista os arquivos de conflito do Nextcloud p/ o humano resolver. O INBOX
+    NÃO apaga nem escolhe versão — só leva você até a pasta pra comparar."""
+
+    def __init__(self, paths, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Conflitos do Nextcloud")
+        self.resize(660, 440)
+        self.paths = paths
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 22, 22, 22)
+        lay.setSpacing(12)
+        title = QLabel("Arquivos de conflito do Nextcloud")
+        title.setStyleSheet(T.LBL_PAGE_TITLE)
+        lay.addWidget(title)
+        note = QLabel(
+            "Quando dois computadores mexem no mesmo arquivo, o Nextcloud guarda "
+            "as duas versões e renomeia uma com sufixo de conflito. Abra a pasta, "
+            "compare e apague a versão errada — o INBOX não apaga nada por você.")
+        note.setStyleSheet(T.LBL_MUTED)
+        note.setWordWrap(True)
+        lay.addWidget(note)
+
+        self.lst = QListWidget()
+        for ap in self.paths:
+            it = QListWidgetItem(Path(ap).name)
+            it.setToolTip(ap)
+            it.setData(Qt.ItemDataRole.UserRole, ap)
+            self.lst.addItem(it)
+        if self.lst.count():
+            self.lst.setCurrentRow(0)
+        self.lst.itemDoubleClicked.connect(lambda *_: self._open_folder())
+        lay.addWidget(self.lst, 1)
+
+        row = QHBoxLayout()
+        b_folder = QPushButton("Abrir pasta")
+        b_folder.clicked.connect(self._open_folder)
+        b_file = QPushButton("Abrir arquivo")
+        b_file.clicked.connect(self._open_file)
+        row.addWidget(b_folder)
+        row.addWidget(b_file)
+        row.addStretch(1)
+        b_close = QPushButton("Fechar")
+        b_close.clicked.connect(self.reject)
+        row.addWidget(b_close)
+        lay.addLayout(row)
+
+    def _selected_path(self):
+        it = self.lst.currentItem()
+        return it.data(Qt.ItemDataRole.UserRole) if it else None
+
+    def _open_folder(self):
+        ap = self._selected_path()
+        if ap:
+            open_path(Path(ap).parent)
+
+    def _open_file(self):
+        ap = self._selected_path()
+        if ap and Path(ap).exists():
+            open_path(Path(ap))
+
+
 # ── janela principal ──────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self, library_root):
@@ -300,6 +366,7 @@ class MainWindow(QMainWindow):
         self._reindexing = False
         self._closing = False
         self._last_reindex_ts = None
+        self._conflicts = []     # rel_paths de arquivos de conflito do Nextcloud
 
         self._build_ui()
         self._refresh_status()
@@ -344,6 +411,17 @@ class MainWindow(QMainWindow):
         self._idx_label = QLabel("")
         self._idx_label.setStyleSheet(T.LBL_HINT)
         sb.addWidget(self._idx_label)
+        # Aviso persistente (à direita) de conflitos do Nextcloud — clicável,
+        # não-modal, escondido quando não há conflito. Ver _update_conflict_indicator.
+        self.btn_conflicts = QPushButton("")
+        self.btn_conflicts.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_conflicts.setStyleSheet(
+            f"QPushButton {{ color: {T.YELLOW}; background: transparent; "
+            "border: none; padding: 0 6px; font-size: 11px; } "
+            "QPushButton:hover { text-decoration: underline; }")
+        self.btn_conflicts.clicked.connect(self._show_conflicts)
+        self.btn_conflicts.hide()
+        sb.addPermanentWidget(self.btn_conflicts)
         self._spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         self._spin_i = 0
         self._spin_msg = ""
@@ -906,6 +984,10 @@ class MainWindow(QMainWindow):
             f"Reindex: +{res['added']} novo(s), {res['rebound']} movido(s), "
             f"{res['kept']} mantido(s), -{res['removed']} órfã(s)"
             + (" (cancelado)" if res["canceled"] else ""))
+        self._set_conflicts(res.get("conflicts", []))
+        nconf = len(res.get("conflicts", []))
+        linha_conf = (f"\n• {nconf} conflito(s) do Nextcloud "
+                      "(clique no aviso amarelo p/ resolver)" if nconf else "")
         titulo = "Reindexação cancelada" if res["canceled"] else "Reindexação concluída"
         QMessageBox.information(
             self, titulo,
@@ -913,7 +995,8 @@ class MainWindow(QMainWindow):
             f"• {res['rebound']} reapontado(s) (arquivo movido)\n"
             f"• {res['kept']} já estavam no índice\n"
             f"• {res['removed']} removido(s) do índice (sumiram do disco)\n"
-            f"• {res['duplicates']} cópia(s) idêntica(s) ignorada(s)")
+            f"• {res['duplicates']} cópia(s) idêntica(s) ignorada(s)"
+            + linha_conf)
         self._lib_reload()
 
     # ---- reindex automático em background (arranque + entrada na Biblioteca) ----
@@ -962,6 +1045,7 @@ class MainWindow(QMainWindow):
     def _on_auto_reindex_done(self, res):
         self._reindexing = False
         self._last_reindex_ts = datetime.now()
+        self._set_conflicts(res.get("conflicts", []))
         novos = res["added"] + res["rebound"]
         if novos > 0:
             self._stop_spin(f"✓ Índice atualizado · +{novos} do disco")
@@ -976,6 +1060,34 @@ class MainWindow(QMainWindow):
         self._reindexing = False
         self._last_reindex_ts = datetime.now()
         self._stop_spin("Falha ao indexar do disco", ok=False, hold_ms=4000)
+
+    # ---- aviso de conflitos do Nextcloud ----
+    def _set_conflicts(self, conflicts):
+        """Atualiza o estado de conflitos a partir de um resultado de reindex e
+        reflete no indicador amarelo. Loga na Atividade recente só quando a lista
+        muda (não a cada arranque)."""
+        conflicts = conflicts or []
+        changed = set(conflicts) != set(self._conflicts)
+        self._conflicts = conflicts
+        self._update_conflict_indicator()
+        if changed and conflicts:
+            self._log_recent(
+                f"⚠ {len(conflicts)} arquivo(s) de conflito do Nextcloud detectado(s).")
+
+    def _update_conflict_indicator(self):
+        n = len(self._conflicts)
+        if n:
+            self.btn_conflicts.setText(
+                f"⚠ {n} conflito{'s' if n != 1 else ''} do Nextcloud — ver")
+            self.btn_conflicts.show()
+        else:
+            self.btn_conflicts.hide()
+
+    def _show_conflicts(self):
+        if not self._conflicts:
+            return
+        paths = [str(self.lib.abs_path(r)) for r in self._conflicts]
+        ConflictsDialog(paths, self).exec()
 
     def _on_archive_fail(self, e):
         self._close_progress()

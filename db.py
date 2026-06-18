@@ -106,14 +106,15 @@ class DB:
             "SELECT * FROM documents WHERE sha256 = ?", (sha256,)).fetchone()
 
     def add_document(self, *, sha256, rel_path, original_name, doc_type,
-                     process_ref, importer, size_bytes, notes="") -> int:
+                     process_ref, importer, size_bytes, notes="",
+                     status="recebido") -> int:
         cur = self.conn.execute(
             """INSERT INTO documents
                (sha256, rel_path, original_name, doc_type, process_ref,
                 importer, size_bytes, status, received_at, notes)
                VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (sha256, rel_path, original_name, doc_type, process_ref,
-             importer, size_bytes, "recebido", _now(), notes))
+             importer, size_bytes, status, _now(), notes))
         self.conn.commit()
         return cur.lastrowid
 
