@@ -36,18 +36,24 @@ class UpdateResult:
         return self.status == "updated"
 
 
-def _git(*args, cwd=REPO_DIR):
-    """Roda um comando git e devolve (returncode, saída combinada)."""
-    proc = subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        timeout=_TIMEOUT,
-        # Evita que o git abra editor/pager ou peça senha interativa e trave a
-        # thread; sem terminal, uma falha de auth vira erro em vez de prompt.
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat"},
-    )
+def _git(*args, cwd=REPO_DIR, timeout=_TIMEOUT):
+    """Roda um comando git e devolve (returncode, saída combinada). Nunca levanta:
+    timeout ou git ausente viram returncode != 0 com uma mensagem."""
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            # Evita que o git abra editor/pager ou peça senha interativa e trave a
+            # thread; sem terminal, uma falha de auth vira erro em vez de prompt.
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat"},
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "git demorou demais (timeout)"
+    except OSError as e:
+        return 127, f"não foi possível executar o git: {e}"
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
     return proc.returncode, out
 
@@ -115,3 +121,40 @@ def pull_updates() -> UpdateResult:
 
     return UpdateResult("updated", "Atualizado para a versão mais recente.",
                         old=old, new=new, files=n, detail=out)
+
+
+class UpdateCheck:
+    """Resultado da verificação de versão nova no arranque (só leitura)."""
+
+    def __init__(self, available=False, behind=0, log="", error=""):
+        self.available = available   # há commits novos p/ puxar?
+        self.behind = behind         # quantos commits atrás do remoto
+        self.log = log               # mini-changelog (git log --oneline)
+        self.error = error           # diagnóstico interno (não mostrado ao cliente)
+
+
+def check_for_updates(fetch_timeout=8, cwd=REPO_DIR) -> UpdateCheck:
+    """Verifica, com `git fetch`, se o remoto tem commits novos. Falha SILENCIOSA:
+    offline, sem deploy key, git ausente ou não-repo → available=False (o app abre
+    normalmente). Não mexe na árvore de trabalho — só atualiza os refs do remoto."""
+    rc, _ = _git("rev-parse", "--is-inside-work-tree", cwd=cwd)
+    if rc != 0:
+        return UpdateCheck(error="não é um repositório git")
+
+    rc, out = _git("fetch", "--quiet", cwd=cwd, timeout=fetch_timeout)
+    if rc != 0:
+        return UpdateCheck(error=out)   # offline/auth/timeout: sem update conhecido
+
+    # upstream da branch atual (ex.: origin/main); cai p/ origin/main se não houver
+    rc, upstream = _git("rev-parse", "--abbrev-ref",
+                        "--symbolic-full-name", "@{u}", cwd=cwd)
+    if rc != 0 or not upstream:
+        upstream = "origin/main"
+
+    rc, count = _git("rev-list", "--count", f"HEAD..{upstream}", cwd=cwd)
+    behind = int(count) if rc == 0 and count.isdigit() else 0
+    if behind <= 0:
+        return UpdateCheck(available=False, behind=0)
+
+    rc, log = _git("log", "--oneline", "--no-decorate", f"HEAD..{upstream}", cwd=cwd)
+    return UpdateCheck(available=True, behind=behind, log=log if rc == 0 else "")

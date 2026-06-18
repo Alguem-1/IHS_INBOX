@@ -1337,6 +1337,45 @@ def ensure_library_root():
     return str(Path(root).expanduser())
 
 
+def maybe_prompt_update():
+    """No arranque, antes de abrir a janela: se houver versão nova (git), oferece
+    atualizar. Falha SILENCIOSA (offline / sem deploy key / não-repo) → o app abre
+    normal. Se o cliente recusar, pergunta de novo no próximo arranque."""
+    try:
+        chk = updater.check_for_updates()
+    except Exception:
+        return
+    if not chk.available:
+        return
+
+    n = chk.behind
+    plural = "ões" if n != 1 else "ão"
+    box = QMessageBox()
+    box.setStyleSheet(T.MAIN_STYLESHEET)
+    box.setIcon(QMessageBox.Icon.Information)
+    box.setWindowTitle("Atualização disponível")
+    box.setText(
+        f"Há uma nova versão do IHS INBOX ({n} atualizaç{plural}).\n\n"
+        "Atualizar agora? O app reinicia já com a versão nova.")
+    if chk.log:
+        box.setDetailedText("O que mudou:\n" + chk.log)
+    logo = Path(__file__).parent / "logo.png"
+    if logo.exists():
+        box.setWindowIcon(QIcon(str(logo)))
+    yes = box.addButton("Atualizar e abrir", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("Agora não", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(yes)
+    box.exec()
+    if box.clickedButton() is not yes:
+        return   # recusou: abre normal; pergunta de novo na próxima
+
+    res = updater.pull_updates()
+    if res.changed:
+        os.execv(sys.executable, [sys.executable, *sys.argv])   # reinicia já atualizado
+    elif res.status != "uptodate":
+        QMessageBox.warning(None, "Atualização", res.message)   # falhou: segue abrindo
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("IHS INBOX")
@@ -1346,6 +1385,8 @@ def main():
     logo = Path(__file__).parent / "logo.png"
     if logo.exists():
         app.setWindowIcon(QIcon(str(logo)))
+
+    maybe_prompt_update()   # oferece atualizar antes de abrir (falha silenciosa)
 
     root = ensure_library_root()
     if not root:
