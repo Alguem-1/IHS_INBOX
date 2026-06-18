@@ -22,6 +22,35 @@ ecossistema IHS e nasce pra virar o **5º card do IHS_HUB**.
 - Busca, preview, checklist de documentos por processo, assistente de migração
   da biblioteca antiga e painel de espaço.
 
+## Instalação no cliente (deploy via SSH + deploy key)
+
+Cada cliente recebe uma **deploy key SSH só-leitura** do repositório no GitHub.
+A instalação é sempre por **`git clone`** — nunca copiando a pasta:
+
+```bash
+git clone git@github.com:Alguem-1/IHS_INBOX.git
+cd IHS_INBOX
+./install_desktop.sh     # cria o atalho no menu
+./iniciar.sh             # 1ª execução: monta o .venv e instala as dependências
+```
+
+> ⚠️ **Não copie a pasta do projeto entre máquinas.** A `.venv/` é local e tem
+> caminhos absolutos da máquina de origem — copiada, ela vem **quebrada**. Ela
+> está no `.gitignore` (não entra no git nem no GitHub) justamente por isso: o
+> `iniciar.sh` recria um ambiente limpo no cliente. Sempre `git clone`.
+>
+> A deploy key é **SSH**, então o `origin` precisa ser `git@github.com:...`
+> (e não a URL `https://`). Instale a chave como `~/.ssh/id_ed25519` ou via uma
+> entrada `Host` no `~/.ssh/config`, pra que o `git pull` funcione mesmo quando
+> o app é lançado pelo atalho do menu (sem terminal/ssh-agent).
+
+## Atualização
+
+Há um botão **"⟳ Atualizar app"** no canto superior direito (visível em todas as
+abas). Ele roda `git pull --ff-only` no código — nunca faz merge, nunca empurra
+e **nunca toca na biblioteca de documentos** (que vive fora do repo). Se houver
+versão nova, oferece reiniciar o app pra aplicar. Veja [`updater.py`](updater.py).
+
 ## Status
 
 🌱 **Projeto novo / greenfield.** Ainda não há código — só o planejamento.

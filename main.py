@@ -6,6 +6,7 @@ Regra de ouro: o INBOX NUNCA interpreta conteúdo fiscal (valores, NCM, pesos,
 quantidades). Só guarda / organiza / acha / mostra o arquivo original.
 """
 
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ from library import Library, QUARANTINE
 from intake import build_proposal, ProcessMatcher, DOC_TYPES, DOC_TYPE_LABELS
 from worker import Worker
 import utils_api
+import updater
 
 try:
     import fitz  # PyMuPDF — preview de PDF
@@ -307,6 +309,21 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_library_tab(), "Biblioteca")
         self.tabs.addTab(self._build_audit_tab(), "Auditoria")
         self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        # Botão global de auto-atualização (canto sup. direito, visível em todas
+        # as abas). Puxa a versão mais recente do código via `git pull` — ver
+        # updater.py. Embrulhado p/ ganhar uma margem à direita.
+        corner = QWidget()
+        cl = QHBoxLayout(corner)
+        cl.setContentsMargins(0, 0, 8, 0)
+        self.btn_update = QPushButton("⟳ Atualizar app")
+        self.btn_update.setToolTip(
+            "Puxar a versão mais recente do IHS INBOX (git pull).\n"
+            f"Versão atual: {updater.current_revision()}")
+        self.btn_update.clicked.connect(self._check_updates)
+        cl.addWidget(self.btn_update)
+        self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
+
         self.setCentralWidget(self.tabs)
 
     def _build_triage_tab(self):
@@ -473,6 +490,59 @@ class MainWindow(QMainWindow):
         self._workers.append(wk)
         wk.start()
         return wk
+
+    # ---- auto-atualização (git pull via deploy key só-leitura) ----
+    def _check_updates(self):
+        """Puxa a versão mais recente do código numa thread (não trava a UI)."""
+        self.btn_update.setEnabled(False)
+        self.btn_update.setText("⟳ Atualizando…")
+        self._run(updater.pull_updates,
+                  on_done=self._on_update_done,
+                  on_fail=self._on_update_failed)
+
+    def _reset_update_button(self):
+        self.btn_update.setText("⟳ Atualizar app")
+        self.btn_update.setEnabled(True)
+
+    def _on_update_done(self, res):
+        self._reset_update_button()
+        if res.status == "updated":
+            self._log_recent(
+                f"Atualizado {res.old} → {res.new} ({res.files} arquivo(s)).")
+            q = QMessageBox.question(
+                self, "Atualizado",
+                f"{res.message}\n\n"
+                f"Versão {res.old} → {res.new} · {res.files} arquivo(s) alterado(s).\n\n"
+                "É preciso reiniciar o IHS INBOX para aplicar. Reiniciar agora?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if q == QMessageBox.StandardButton.Yes:
+                self._restart_app()
+        elif res.status == "uptodate":
+            QMessageBox.information(self, "Atualizar", res.message)
+        elif res.status == "notgit":
+            QMessageBox.warning(self, "Atualizar", res.message)
+        else:  # error
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Critical)
+            box.setWindowTitle("Falha ao atualizar")
+            box.setText(res.message)
+            if res.detail:
+                box.setDetailedText(res.detail)
+            box.exec()
+
+    def _on_update_failed(self, msg):
+        self._reset_update_button()
+        QMessageBox.critical(self, "Falha ao atualizar",
+                             f"Não foi possível atualizar:\n{msg}")
+
+    def _restart_app(self):
+        """Re-executa o app com o código novo já em disco."""
+        try:
+            self.db.close()
+        except Exception:
+            pass
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
     # ---- integração UTILS (só-leitura) ----
     def _resolve_importer(self, ref):
